@@ -1,0 +1,14 @@
+{
+ "mode": "static",
+ "alpha": 0.9,
+ "text_alpha": 1.0,
+ "scale": 1.0,
+ "font_size": 16,
+ "titleColor": "#c9a86a",
+ "interval": 0.6,
+ "settle": 0.25,
+ "locked": true,
+ "level": 3,
+ "forceTopmost": true,
+ "liveMode": true
+}

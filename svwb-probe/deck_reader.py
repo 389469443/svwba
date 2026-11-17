@@ -479,7 +479,49 @@ def _find_deck(h, RW, state):
 
 _LAST_SNAP = {"data": None, "at": 0.0}
 _LAST_SNAP_LOCK = threading.RLock()
-SNAPSHOT_STALE_SEC = 6.0  # Three missed two-second heartbeats.
+SNAPSHOT_STALE_SEC = 30.0
+# 最近一次成功解析出的卡组构成。读取竞态（卡组文件正在被重写、内存缓存刚被清）
+# 会让某一帧的 deck_ids 为空，进而把「牌库中」整段算成空 —— 记牌器上看起来
+# 就是整列表卡牌消失、过一会儿又回来。这里留一份兜底。
+_LAST_ROWS = {"ids": [], "at": 0.0}
+
+# 实时读取的「死因」缓存（frida_live 写在 logs/reader_status.json）
+_RS = {"at": 0.0, "txt": ""}
+
+
+def _reader_status_hint():
+    """实时读取为什么没起来 —— 给界面状态栏用的一句话。
+
+    2026-11-13：朋友的机器上只有一句「读取未启动」，分不清是**没找到游戏进程**
+    还是**压根没启动读取**，来回猜了好几轮。探针那边现在会把死因落盘，
+    这里带出来显示，谁的问题一眼就能看出来。
+    """
+    now = time.monotonic()
+    if now - _RS["at"] < 3.0:
+        return _RS["txt"]
+    _RS["at"] = now
+    txt = ""
+    try:
+        path = os.path.join(HERE, "logs", "reader_status.json")
+        with open(path, encoding="utf-8") as fh:
+            st = json.load(fh)
+        why = str(st.get("why") or "")
+        txt = {"nopid": "没找到游戏进程",
+               "nomod": "游戏还没进页面",
+               "starting": "正在连接游戏",
+               "ok": "读取已断",
+               "error": "读取启动失败"}.get(why, "")
+        # "ok" 不等于「现在正常」：它只说明**曾经**挂上过。能看到这句空文案
+        # 的时候，牌库快照已经读不到了 —— 那就是连上之后又断了（游戏重启、
+        # 模拟器换进程、读取器被收掉）。这条不按时间过期：断了就是断了，
+        # 2026-11-15 用户朋友的机器上正是只有「读取未启动」这一句，无法判断。
+        if txt and why != "ok" \
+                and time.time() - float(st.get("at") or 0) / 1000.0 > 300:
+            txt = ""            # 太久以前的不算数（上一局/上一次启动留下的）
+    except Exception:
+        txt = ""
+    _RS["txt"] = txt
+    return txt
 
 
 def snapshot(min_refresh=3.0):
@@ -496,7 +538,7 @@ def snapshot(min_refresh=3.0):
     with _LAST_SNAP_LOCK:
         if snap is not None and snap.get("in_battle"):
             _LAST_SNAP["data"] = snap
-            _LAST_SNAP["at"] = now - max(0.0, time.time() - snap["sample_at"] / 1000.0)
+            _LAST_SNAP["at"] = now
             return dict(snap)
         cached = _LAST_SNAP.get("data")
         age = now - _LAST_SNAP.get("at", 0.0)
@@ -505,10 +547,11 @@ def snapshot(min_refresh=3.0):
                      str(snap.get("reason") or ""))
         if transient and cached is not None and age < SNAPSHOT_STALE_SEC:
             return dict(cached)
-        _LAST_SNAP.update(data=None, at=0.0)
         if snap is None:
+            hint = _reader_status_hint()
             return {"in_battle": False,
-                    "reason": "等待常驻读取（logs/deck_live.json）"}
+                    "reason": "等待常驻读取（logs/deck_live.json）"
+                              + ("，" + hint if hint else "")}
         return snap
 
 
@@ -518,30 +561,24 @@ def _snapshot_impl(min_refresh=3.0):
     path = LIVE_PATH
     try:
         with io.open(path, encoding="utf-8") as fh:
-            raw = fh.read()
-        s = json.loads(raw)
+            s = json.load(fh)
     except Exception:
         # 读到半写 JSON、文件被替换或瞬时 IO 错误时由 snapshot() 返回缓存。
         return None
-    if s.get("idle") or s.get("ended"):
+    if s.get("idle"):
         return {"in_battle": False, "reason": "等待进入对局"}
     age = time.time() - float(s.get("at") or 0) / 1000.0
-    if age >= SNAPSHOT_STALE_SEC:
+    # 对局结束后 frida 不再写 deck_live.json → 10 秒内清空（外层还有缓存兜底，
+    # 避免 500ms 写入竞态时来回闪成"当前卡组"）
+    if age > 30:
         return {"in_battle": False, "reason": "对局已结束 / 实时读取未在跑"}
-    ready = s.get("handReady", bool(s.get("mulliganDone") or (s.get("turn") or 0) > 0))
-    hand = [c for c in s.get("hand") or [] if c] if ready else []
+    hand = [c for c in s.get("hand") or [] if c]
     played = [c for c in s.get("played") or [] if c]
     destroyed = [c for c in s.get("destroyed") or [] if c]
     deck_ids = _CACHE.get("deck_ids") or []
     from_file = False
     # 手动导入的卡组**优先**：内存扫描缓存可能是旧卡组/别的卡组，
     # 会导致牌库数字不减、显示错误的卡组构成（用户 2026-10-29）
-    names_by_id = {}
-    def name_of(cid):
-        if cid not in names_by_id:
-            names_by_id[cid] = _name_of(cid)
-        return names_by_id[cid]
-
     decks_all = _decks_from_file()
     if decks_all:
         from_file = True
@@ -549,20 +586,30 @@ def _snapshot_impl(min_refresh=3.0):
         active = _active_name()
         ordered = [x for x in decks_all if x.get("name") == active]
         ordered += [x for x in decks_all if x.get("name") != active]
-        if ordered[0].get("name") == active or not seen0:
+        if not seen0:
             deck_ids = ordered[0]["cards"]
         else:
+            active_item = next(
+                (x for x in ordered if x.get("name") == active), None)
             best = None
             for item in ordered:
-                names = set(name_of(c) for c in item["cards"])
+                names = set(_name_of(c) for c in item["cards"])
                 hit = sum(1 for c in seen0
-                          if name_of(c) and name_of(c) in names)
+                          if _name_of(c) and _name_of(c) in names)
                 if best is None or hit > best[0]:
                     best = (hit, item["cards"])
             # 手牌少时（1~3 张）也要能匹配上：门槛 max(1, len//4)
             need = max(1, len(seen0) // 4)
             if best and best[0] >= need:
                 deck_ids = best[1]
+            elif active_item:
+                deck_ids = active_item["cards"]
+    # 这一帧没解析出卡组构成（卡组文件正在被重写 / 缓存刚被清）：先用最近一次
+    # 成功解析的那份兜底，别把「牌库中」整段清空 —— 那看起来就是卡牌全消失。
+    if not deck_ids:
+        now_m = time.monotonic()
+        if _LAST_ROWS["ids"] and now_m - _LAST_ROWS["at"] < 180:
+            deck_ids = list(_LAST_ROWS["ids"])
     # 有导入卡组时不再做内存扫描（本来就扫不到，白卡 6GB）
     if not deck_ids and not from_file and not _CACHE.get("deck_scanning"):
         _CACHE["deck_scanning"] = True
@@ -571,7 +618,9 @@ def _snapshot_impl(min_refresh=3.0):
             pid, _ = RW.find_game_pid()
             h = RW.open_proc(pid)
             state = {"addr": s.get("addr"), "deckCount": s.get("deck"),
-                     "life": s.get("life"), "pp": s.get("pp"), "maxpp": s.get("maxpp"), "enemy": s.get("enemy"), "mulliganDone": bool(s.get("mulliganDone")), "retire": bool(s.get("retire")), "hand": hand,
+                     "life": s.get("life"), "pp": s.get("pp"), "maxpp": s.get("maxpp"),
+                     "turn": s.get("turn"), "enemy": s.get("enemy"),
+                     "hand": hand,
                      "played": played, "destroyed": destroyed}
 
             def _bg():
@@ -588,78 +637,87 @@ def _snapshot_impl(min_refresh=3.0):
         deck_ids = []
     if not deck_ids:
         # 卡组没扫到：牌库列表留空，手牌由 deck_tracker 单独显示
-        return {"in_battle": True, "handReady": ready, "addr": s.get("addr"), "sample_at": s["at"], "deckCount": s.get("deck"),
-                "life": s.get("life"), "pp": s.get("pp"), "maxpp": s.get("maxpp"), "enemy": s.get("enemy"), "mulliganDone": bool(s.get("mulliganDone")), "retire": bool(s.get("retire")), "hand": hand, "played": played,
+        return {"in_battle": True, "deckCount": s.get("deck"),
+                "life": s.get("life"), "pp": s.get("pp"), "maxpp": s.get("maxpp"),
+                     "turn": s.get("turn"), "enemy": s.get("enemy"),
+                     "hand": hand, "played": played,
+                # seq = 探针的「本局流水号」，记牌器用它保证一局只记一次胜负
+                "seq": s.get("seq"),
+                "hold": bool(s.get("hold")),
                 "destroyed": destroyed, "total": 0,
                 "remaining": s.get("deck") or 0, "rows": [],
                 "overdraw": int(s.get("overdraw") or 0),
-                 "opponentPublicHand": s.get("opponentPublicHand") or [],
-                "opponentPublicHandReady": bool(s.get("opponentPublicHandReady")),
-                "playedFromHand": s.get("playedFromHand") or {}, "returnCounts": s.get("returnCounts", {}), "returned": bool(s.get("returned") or s.get("returnCounts"))}
+                "returned": bool(s.get("returned"))}
+    # 记下这份能用的卡组构成，供上面「读不到卡组」的分支兜底
+    _LAST_ROWS["ids"] = list(deck_ids)
+    _LAST_ROWS["at"] = time.monotonic()
     from collections import Counter
     total = Counter(deck_ids)
-    returns = Counter({int(cid): n for cid, n in s.get("returnCounts", {}).items()})
-    available = total.copy()
-    for cid, count in returns.items():
-        match = cid
-        if cid not in total and name_of(cid):
-            match = next((k for k in total if name_of(k) == name_of(cid)), cid)
-        available[match] += count
-
-    def mapped(cards):
-        remaining = available.copy()
-        # 优先匹配卡 ID，同名异画只分配尚未扣除的份额。
-        counts = Counter(cards)
-        allocated = remaining & counts
-        remaining.subtract(allocated)
-        unmatched = Counter()
-        for cid, qty in (counts - allocated).items():
-            key = name_of(cid)
-            if key:
-                unmatched[key] += qty
-        if unmatched:
-            for cid in sorted(available):
-                key = name_of(cid)
-                qty = min(remaining[cid], unmatched[key])
-                allocated[cid] += qty
-                remaining[cid] -= qty
-                unmatched[key] -= qty
-        return allocated
-
-    # 每种证据独立映射到导入卡组，再取最大值，避免同一张牌跨区重复扣除。
-    in_hand = mapped(hand)
-    observed = Counter({int(cid): int(n) for cid, n in
-                        (s.get("observedDraws") or {}).items() if int(n) > 0})
-    for raw_id, qty in (s.get("redrawFloor") or {}).items():
-        cid = int(raw_id)
-        if cid in total or (name_of(cid) and any(name_of(k) == name_of(cid) for k in total)):
-            observed[cid] = max(observed[cid], int(qty))
-    evidence = mapped(observed) | in_hand
-    if not s.get("returned") and not returns:
-        evidence |= mapped(hand + played) | mapped(hand + destroyed)
-    remaining = available - evidence
-    # 一张原始牌最多占一个位置。按卡名在各异画之间共享上限；
-    # 新生成且不在原始牌组里的卡仍按实际洗入的数量统计。
-    if returns:
-        capacity = Counter()
-        group = {cid: name_of(cid) or cid for cid in total}
-        for cid, qty in total.items():
-            capacity[group[cid]] += qty - in_hand[cid]
-        for cid in sorted(total):
-            key = group[cid]
-            remaining[cid] = min(remaining[cid], max(0, capacity[key]))
-            capacity[key] -= remaining[cid]
-    if s.get("deck") == 0:
-        remaining.clear()
-    rows = [(cid, total[cid], remaining[cid], in_hand[cid]) for cid in sorted(set(total) | set(remaining))]
-    return {"in_battle": True, "handReady": ready, "addr": s.get("addr"), "sample_at": s["at"], "deckCount": s.get("deck"),
-            "life": s.get("life"), "pp": s.get("pp"), "maxpp": s.get("maxpp"), "enemy": s.get("enemy"), "mulliganDone": bool(s.get("mulliganDone")), "retire": bool(s.get("retire")), "hand": hand, "played": played,
+    # 「已经不在牌库里的牌」= 手牌 + 战场 + 墓地。
+    #
+    # ⚠️ 2026-11-13 用户实测两个 bug，根子都在这里：
+    #   ① 【魅惑的魅魔·莉莉姆】3 张、打出 1 张（随后谢幕曲发动、进墓地），
+    #      牌库该剩 2 张，界面显示 1 张。原因：以前把「已使用」也算进来，
+    #      而这张牌**打出过一次（played）、又死过一次（destroyed）**，
+    #      同一张实体牌被扣了两遍 → 少 1 张。
+    #   ② 【亡者召还】把墓地的同名随从召到场上，牌库同样被多扣。
+    #      那些牌是从墓地回到场上的，本来就没从牌库再抽一次。
+    # 手牌 + 战场 + 墓地恰好是「所有离开牌库的实体牌」，各算一次、不会重复；
+    # played 是「本局用过哪些牌」的流水记录，会重复计数，只能用来判身份/谢幕曲。
+    field_ids = []
+    field_cards = []          # 带 atk/life/ev 的完整版本（进化判定用）
+    for c in (s.get("field") or []):
+        if isinstance(c, dict):          # 战场元素是 {cardId, atk, life, ev}
+            try:
+                _cid = int(c.get("cardId") or 0)
+            except Exception:
+                _cid = 0
+            if _cid > 0:
+                field_cards.append({"cardId": _cid,
+                                    "uid": c.get("uid"),
+                                    "atk": c.get("atk"),
+                                    "life": c.get("life"),
+                                    "ev": c.get("ev")})
+            c = c.get("cardId")
+        try:
+            c = int(c)
+        except Exception:
+            continue
+        if c > 0:
+            field_ids.append(c)
+    left = Counter(hand) + Counter(field_ids) + Counter(destroyed)
+    # 同名不同 id（普通/异画版本）按卡名归并，否则 id 版本不同永远差不上
+    left_by_name = Counter()
+    for cid, n in left.items():
+        left_by_name[_name_of(cid) or str(cid)] += n
+    hand_by_name = Counter()
+    for cid in hand:
+        hand_by_name[_name_of(cid) or str(cid)] += 1
+    rows = []
+    for cid in sorted(total):
+        n = total[cid]
+        key = _name_of(cid) or str(cid)
+        d = min(left_by_name.get(key, 0), n)
+        rows.append((cid, n, n - d, hand_by_name.get(key, 0)))
+    return {"in_battle": True, "deckCount": s.get("deck"),
+            "life": s.get("life"), "pp": s.get("pp"), "maxpp": s.get("maxpp"),
+                     "turn": s.get("turn"), "enemy": s.get("enemy"),
+                     "hand": hand, "played": played, "field": field_ids,
+            # 场地随从的完整信息（含进化状态 ev：0 未进化 / 1 进化 / 2 超进化）
+            "field_cards": field_cards,
+            "seq": s.get("seq"), "hold": bool(s.get("hold")),
+            "newGame": bool(s.get("newGame")),
+            # 进化点 / 超进化点（2026-11-17 试验）：探针按字段名反射读到才有值，
+            # 读不到就是 None。现在只用于日志，不参与任何判定。
+            # evc=本局进化次数、mevc=手动进化次数、evt/sevt=进化的回合数。
+            "ep": s.get("ep"), "sep": s.get("sep"),
+            "maxep": s.get("maxep"), "maxsep": s.get("maxsep"),
+            "evc": s.get("evc"), "mevc": s.get("mevc"),
+            "evt": s.get("evt"), "sevt": s.get("sevt"),
             "destroyed": destroyed, "total": len(deck_ids),
             "remaining": s.get("deck") or 0, "rows": rows,
             "overdraw": int(s.get("overdraw") or 0),
-             "opponentPublicHand": s.get("opponentPublicHand") or [],
-                "opponentPublicHandReady": bool(s.get("opponentPublicHandReady")),
-                "playedFromHand": s.get("playedFromHand") or {}, "returnCounts": s.get("returnCounts", {}), "returned": bool(s.get("returned") or s.get("returnCounts"))}
+            "returned": bool(s.get("returned"))}
 
 
 def warm_deck():
@@ -673,12 +731,10 @@ def warm_deck():
     import io
     try:
         with io.open(LIVE_PATH, encoding="utf-8") as fh:
-            raw = fh.read()
-        s = json.loads(raw)
+            s = json.load(fh)
     except Exception:
         return 0
-    ready = s.get("handReady", bool(s.get("mulliganDone") or (s.get("turn") or 0) > 0))
-    hand = [c for c in s.get("hand") or [] if c] if ready else []
+    hand = [c for c in s.get("hand") or [] if c]
     played = [c for c in s.get("played") or [] if c]
     destroyed = [c for c in s.get("destroyed") or [] if c]
     try:
@@ -686,7 +742,9 @@ def warm_deck():
         pid, _ = RW.find_game_pid()
         h = RW.open_proc(pid)
         state = {"addr": s.get("addr"), "deckCount": s.get("deck"),
-                 "life": s.get("life"), "pp": s.get("pp"), "maxpp": s.get("maxpp"), "enemy": s.get("enemy"), "mulliganDone": bool(s.get("mulliganDone")), "retire": bool(s.get("retire")), "hand": hand,
+                 "life": s.get("life"), "pp": s.get("pp"), "maxpp": s.get("maxpp"),
+                     "turn": s.get("turn"), "enemy": s.get("enemy"),
+                     "hand": hand,
                  "played": played, "destroyed": destroyed}
         ids = _find_deck(h, RW, state)
         if ids:

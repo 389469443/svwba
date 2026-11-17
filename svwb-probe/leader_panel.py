@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-主战者效果面板 v1.2.0（独立小面板，只负责显示）
+主战者效果面板 V1.0（独立小面板，只负责显示）
 
 用途
 ----
@@ -657,23 +657,9 @@ class LeaderPanel:
             self._cancel_tick()
 
     # ---------- 设置热读（不透明度 / 字号） ----------
-    def _set_stream_mode(self, enabled):
-        if self._streaming == enabled:
-            return
-        self._streaming = enabled
-        self.root.overrideredirect(not enabled)
-        self.root.attributes("-transparentcolor", "" if enabled else (BALL_CHROMA if self.ball_mode else ""))
-        self._apply_alpha()
-        if enabled:
-            import stream_settings
-            self.root.update_idletasks()
-            stream_settings.capture_style(self.root)
-        else:
-            self._apply_alpha()
-
     def _apply_alpha(self):
         try:
-            self.root.attributes("-alpha", 1.0 if self._streaming else float(self._alpha))
+            self.root.attributes("-alpha", float(self._alpha))
         except Exception:
             pass
         top = getattr(self, "_detail", None)
@@ -765,9 +751,6 @@ class LeaderPanel:
         root = self.root
         root.title(self.title_text)
         root.overrideredirect(True)    # 无边框
-        self._streaming = False
-        import stream_settings
-        stream_settings.watch(root, self._set_stream_mode)
         root.configure(bg=BG)
         try:
             root.attributes("-topmost", False)
@@ -1208,7 +1191,7 @@ class LeaderPanel:
         """球形态：56x56 + 抠色（方角透明）"""
         try:
             self.outer.configure(highlightthickness=0, bg=BALL_CHROMA)
-            self.root.attributes("-transparentcolor", "" if self._streaming else BALL_CHROMA)
+            self.root.attributes("-transparentcolor", BALL_CHROMA)
         except tk.TclError:
             pass
         try:

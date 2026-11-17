@@ -3,7 +3,7 @@ rem 强制中文代码页
 chcp 936 >nul 2>nul
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
-title 影之诗助手 · 收集诊断信息
+title 影之幻境助手 · 收集诊断信息
 
 echo ============================================================
 echo    收集诊断信息

@@ -104,53 +104,164 @@ def _workingset(pid):
     return ws
 
 
-def _can_open(pid):
-    """能否以读写权限打开该进程（MuMu 服务/受保护进程会拒绝）。"""
-    try:
-        h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                            False, int(pid))
-        if not h:
-            return False
-        k32.CloseHandle(h)
-        return True
-    except Exception:
-        return False
+class _FT(C.Structure):
+    _fields_ = [("lo", W.DWORD), ("hi", W.DWORD)]
 
 
-def _is_game_image(path):
-    base = os.path.basename(path).lower()
-    if base in ("shadowversewb.exe", "shadowverseworldsbeyond.exe"):
-        return True
-    # Never use the emulator host or the original Shadowverse client.
-    if base == "shadowverse.exe" or any(word in base for word in
-            ("nxdevice", "mumuplayer", "mumuwin", "mumuapp", "mumuvmm")):
-        return False
-    return "影之诗" in base or "warchess" in base
+def pid_age(pid):
+    """进程已经启动了多久（秒）；拿不到返回 None。
 
+    ⚠️ 为什么需要它（2026-11-07 用户实测）：关掉游戏后，模拟器容器会立刻
+       以**新的 pid** 重新起来，`find_game_pid()` 一眼就能找到它。控制台看到
+       「换了个 pid」就当成「玩家重新开了游戏」，马上去 attach ——
+       可那个进程还在初始化界面/正在收尾，Frida 一挂上去就把它的主线程钉住，
+       用户看到的就是「游戏关不掉、未响应」。
 
-
-def has_game_module(pid):
-    """Read module names before connecting; no injection and no memory scan."""
-    h = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, int(pid))
+       所以挂之前必须先看年龄：刚出生十几秒的进程一律不碰，等它稳定下来。
+    """
+    h = k32.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
     if not h:
-        return False
+        return None
     try:
-        modules = (C.c_void_p * 2048)()
-        needed = W.DWORD()
-        psapi.EnumProcessModulesEx.argtypes = (W.HANDLE, C.c_void_p, W.DWORD, C.POINTER(W.DWORD), W.DWORD)
-        psapi.GetModuleBaseNameW.argtypes = (W.HANDLE, C.c_void_p, W.LPWSTR, W.DWORD)
-        if not psapi.EnumProcessModulesEx(h, modules, C.sizeof(modules), C.byref(needed), 3):
-            return False
-        for module in modules[:min(len(modules), needed.value // C.sizeof(C.c_void_p))]:
-            name = C.create_unicode_buffer(260)
-            if psapi.GetModuleBaseNameW(h, module, name, len(name)) and name.value.lower() == "gameassembly.dll":
-                return True
-        return False
+        c, e, k, u = _FT(), _FT(), _FT(), _FT()
+        k32.GetProcessTimes.argtypes = [W.HANDLE, C.POINTER(_FT),
+                                        C.POINTER(_FT), C.POINTER(_FT),
+                                        C.POINTER(_FT)]
+        if not k32.GetProcessTimes(h, C.byref(c), C.byref(e),
+                                   C.byref(k), C.byref(u)):
+            return None
+        born = ((c.hi << 32) | c.lo) / 1e7            # 100ns → 秒（1601 起）
+        now = time.time() + 11644473600.0             # Unix → 1601 起
+        age = now - born
+        return age if age >= 0 else 0.0
+    except Exception:
+        return None
     finally:
-        k32.CloseHandle(h)
+        try:
+            k32.CloseHandle(h)
+        except Exception:
+            pass
 
 
-def find_game_pid(preferred_pid=None):
+# ------------------------------------------------------------ 进程名特征
+# ⚠️ 2026-11-13：朋友的 MuMu「非高清版」认不到游戏，根子就在这串关键词太窄。
+#    以前只认 shadowverse / 影之诗 / warchess / mumu，而且 mumu **只比文件名**。
+#    可模拟器一换代，宿主上的进程就叫 NemuHeadless.exe、MuMuVMMHeadless.exe、
+#    MuMuNxDevice.exe …… 有的连 "mumu" 都没有（网易系叫 Nemu*），
+#    有的关键词只出现在**路径**里（C:\Program Files\Netease\MuMu\...），
+#    于是一个都命中不了 —— 表现就是界面永远「读取未启动」。
+#    现在：文件名和完整路径一起比，关键词覆盖网易系 / 雷神系 / 海外系常见写法。
+# 硬关键词：命中就是模拟器/游戏，不用再犹豫
+STRONG_KEYS = ("shadowverse", "warchess", "影之诗", "mumu", "nemu",
+               "nexus", "nxdevice", "nxmain", "ldplayer", "dnplayer",
+               "bluestacks", "bstk", "memu")
+# 软关键词：网易/虚拟机的通用词。网易云音乐、UU 加速器之类也在这些目录下，
+# 所以软命中**额外要求工作集 ≥ 800MB**（真模拟器都是 GB 级，音乐客户端到不了）
+WEAK_KEYS = ("netease", "vbox")
+GAME_KEYS = STRONG_KEYS + WEAK_KEYS
+WEAK_MIN_WS = 800 * 1048576
+# 辅助进程：名字命中了也不是游戏本体（崩溃报告、更新器、服务、卸载器……）
+SKIP = ("launcher", "crashpad", "crash", "reporter", "unicrash",
+        "handler", "service", "healthd", "backend", "plugin", "uninstall",
+        "update", "setup", "helper", "installer", "advertise", "updater")
+# 宿主上的解释器：助手自己的路径里就带「影之诗」，不加这条会把自己当成游戏
+SELF_SKIP = ("python.exe", "pythonw.exe", "javaw.exe", "node.exe",
+             "cmd.exe", "conhost.exe", "wt.exe", "code.exe")
+MIN_WS = 200 * 1048576          # 200 MB
+_DIAG_AT = 0.0
+
+
+def _verdict(p, base):
+    """一个进程该怎么看：(是不是候选, 原因)。诊断日志和选进程共用这一套判断。"""
+    if any(s in base for s in SKIP):
+        return False, "辅助进程"
+    if base in SELF_SKIP:
+        return False, "解释器"
+    low = p.lower()
+    # 助手自己就装在「影之诗助手」目录里，路径会被 "影之诗" 命中 —— 先排掉
+    if "影之诗助手" in low:
+        return False, "助手自己"
+    # 文件名优先（更准），文件名不中再看完整路径
+    strong = [k for k in STRONG_KEYS if k in base] or \
+             [k for k in STRONG_KEYS if k in low]
+    if strong:
+        return True, "命中%s" % strong[0]
+    weak = [k for k in WEAK_KEYS if k in base] or \
+           [k for k in WEAK_KEYS if k in low]
+    if weak:
+        return True, "弱命中%s" % weak[0]
+    return False, "名字不命中"
+
+
+def _scan_candidates():
+    """所有够格的候选（工作集够大的模拟器/游戏进程），按工作集降序。"""
+    cands = []
+    for pid in enum_pids():
+        if not pid or pid == os.getpid():
+            continue
+        p = pid_image(pid)
+        if not p:
+            continue
+        # ⚠️ 不要要求扩展名是 .exe：本机游戏的可执行文件实际叫
+        #    "MuMu模拟器x影之诗高清版.o"（没有 .exe 后缀）。
+        base = os.path.basename(p).lower()
+        ok, why = _verdict(p, base)
+        if not ok:
+            continue
+        ws = _workingset(pid)
+        if ws < MIN_WS:
+            continue
+        # 软关键词（netease/vbox）可能撞上网易云音乐这类普通客户端，
+        # 真游戏在模拟器里从没低于 800MB，用工作集把误判挡掉
+        if why.startswith("弱命中") and ws < WEAK_MIN_WS:
+            continue
+        cands.append((ws, pid, p, why))
+    cands.sort(reverse=True)
+    return cands
+
+
+def dump_process_diag(limit=40, result=None):
+    """把「宿主上都有什么进程」写进 logs/进程识别.log。
+
+    为什么需要它：朋友的机器上没装 Python、也不会跑诊断脚本，但**助手自己**
+    在找进程 —— 让它把现场写下来，比让人装工具靠谱。只在「没找到游戏进程」
+    时写，每次重写（不追加），不会越滚越大。
+    """
+    path = os.path.join(HERE, "logs", "进程识别.log")
+    try:
+        import datetime
+        rows = []
+        for pid in enum_pids():
+            if not pid:
+                continue
+            p = pid_image(pid)
+            if not p:
+                continue
+            rows.append((_workingset(pid), pid, p))
+        rows.sort(reverse=True)
+        lines = [
+            "影之诗助手 · 进程识别（找不到游戏时自动写）",
+            "时间：%s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "规则：硬关键词 %s；软关键词 %s（要 ≥%dMB）；排除 %s；工作集 ≥ %dMB" % (
+                "/".join(STRONG_KEYS), "/".join(WEAK_KEYS),
+                WEAK_MIN_WS // 1048576, "/".join(SKIP), MIN_WS // 1048576),
+            "本次结果：%s" % (result or "无候选"),
+            "",
+            "%-8s %-9s %-12s %s" % ("PID", "工作集", "结论", "路径"),
+        ]
+        for ws, pid, p in rows[:limit]:
+            ok, why = _verdict(p, os.path.basename(p).lower())
+            lines.append("%-8d %8dMB %-12s %s"
+                         % (pid, ws // 1048576, ("候选" if ok else why), p))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+    except Exception:
+        return None
+
+
+def find_game_pid():
     """
     找出**真正的游戏进程**。
 
@@ -160,46 +271,22 @@ def find_game_pid(preferred_pid=None):
        结果五个源全部"类未找到"，因为扫的是一个空进程。
 
     修正：
-      1) 只拿**文件名**匹配（不看路径）
-      2) 排除 crash / reporter / unicrash 等辅助进程
+      1) 文件名和完整路径都参与匹配（见 GAME_KEYS）
+      2) 排除 crash / reporter / unicrash 等辅助进程，也排除解释器（助手自己）
       3) 要求工作集 > 200MB（游戏实测 700MB+，辅助进程都远小于此）
-      4) 优先国际服客户端，同类候选取工作集最大的
+      4) 多个候选时取工作集最大的
+      5) 一个都没找到时，把现场写进 logs/进程识别.log（30 秒最多一次）
     """
-    SKIP = ("launcher", "crashpad", "crash", "reporter", "unicrash",
-            "handler", "service", "healthd", "backend", "plugin", "uninstall",
-            "update", "setup", "helper", "nxmain", "nxservice", "headless",
-            "vmm", "remote", "emulator", "nexus", "healthd")
-    MIN_WS = 200 * 1048576          # 200 MB
-    cands = []
-    foreground_pid = W.DWORD()
-    user32 = C.windll.user32
-    user32.GetForegroundWindow.restype = W.HWND
-    user32.GetWindowThreadProcessId.argtypes = [W.HWND, C.POINTER(W.DWORD)]
-    user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), C.byref(foreground_pid))
-    for pid in enum_pids():
-        p = pid_image(pid)
-        if not p:
-            continue
-        # ⚠️ 不要要求扩展名是 .exe：本机游戏的可执行文件实际叫
-        #    "MuMu模拟器x影之诗高清版.o"（没有 .exe 后缀），
-        #    加了 .exe 判断会把真正的游戏排除掉。
-        base = os.path.basename(p).lower()      # ← 只看文件名，不看路径
-        if any(s in base for s in SKIP):
-            continue
-        if not _is_game_image(p):
-            continue
-        ws = _workingset(pid)
-        if ws < MIN_WS:
-            continue
-        # 权限检查：MuMu 服务/受保护进程 OpenProcess 会失败（frida err=5），跳过
-        if not _can_open(pid) or not has_game_module(pid):
-            continue
-        international = base in ("shadowversewb.exe", "shadowverseworldsbeyond.exe")
-        cands.append((pid == foreground_pid.value, pid == preferred_pid, international, ws, pid, p))
-    if not cands:
-        return None, None
-    cands.sort(reverse=True)
-    return cands[0][-2], cands[0][-1]
+    cands = _scan_candidates()
+    if cands:
+        ws, pid, p, why = cands[0]
+        return pid, p
+    global _DIAG_AT
+    now = time.time()
+    if now - _DIAG_AT > 30:      # 控制台会反复重试，别每次都写盘
+        _DIAG_AT = now
+        dump_process_diag()
+    return None, None
 
 
 # ------------------------------------------------------------------ memory

@@ -1,0 +1,47 @@
+{
+  "name": "dsh-shadowverse-huanjing",
+  "version": "0.1.0",
+  "description": "影之诗·影之幻境 DSH 辅助插件：战斗蒙特卡洛模拟引擎（先后手判定 / 关键词 / 伤害分布 / 贝叶斯融合），以 DSH 工具与本地 HTTP 路由两种方式暴露",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "shadowverse",
+    "huanjing",
+    "monte-carlo",
+    "autochess"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "bin": {
+    "huanjing": "bin/huanjing.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./battle": "./lib/battle.mjs",
+    "./rules": "./lib/rules.mjs",
+    "./simulate": "./lib/simulate.mjs",
+    "./validate": "./lib/validate.mjs"
+  },
+  "files": [
+    "lib",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "selftest": "node bin/huanjing.mjs --selftest",
+    "bench": "node bin/huanjing.mjs --bench --sims 20000",
+    "demo": "node bin/huanjing.mjs --input examples/battle-sample.json --sims 20000 --report"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

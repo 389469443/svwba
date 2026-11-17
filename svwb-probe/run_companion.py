@@ -25,82 +25,20 @@ except SystemExit:
 except Exception:
     pass
 
-
-def _missing_companion_deps():
-    """宠物渲染 / AI 陪玩依赖；新机器没装时给出明确提示，而不是静默透明窗。"""
-    import contextlib
-    import importlib
-    import io
-    need = (("pygame", "pygame"),
-            ("OpenGL", "PyOpenGL"),
-            ("live2d", "live2d-py"))
-    missing = []
-    for mod, pkg in need:
-        try:
-            with contextlib.redirect_stdout(io.StringIO()):
-                module = importlib.import_module(mod)
-            # 旧版 live2d-py 0.4.x 的顶层没有 Model，宠物会渲染失败。
-            if mod == "live2d" and not hasattr(module, "Model"):
-                missing.append(pkg)
-        except Exception:
-            missing.append(pkg)
-    return missing
-
-
-_missing = _missing_companion_deps()
-if _missing:
-    _msg = ("AI 陪玩缺少运行库：%s\n\n"
-            "请双击助手目录里的「修复环境.bat」自动安装，\n"
-            "装好后再从控制台点「启动宠物」。" % "、".join(_missing))
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-        _r = tk.Tk()
-        _r.withdraw()
-        messagebox.showerror("AI 陪玩无法启动", _msg)
-        _r.destroy()
-    except Exception:
-        pass
-    try:
-        os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)
-        with open(os.path.join(HERE, "logs", "companion-err.log"), "a",
-                  encoding="utf-8") as _fh:
-            _fh.write("%s 缺少依赖：%s\n"
-                      % (time.strftime("%Y-%m-%d %H:%M:%S"),
-                         "、".join(_missing)))
-    except Exception:
-        pass
-    print(_msg, flush=True)
-    raise SystemExit(1)
-
 import pet_view
 import companion
 
 AUTO_FRIDA = "--no-frida" not in sys.argv
 
 w = pet_view.PetView()
-_requests_missing = False
-try:
-    import requests as _requests  # noqa: F401
-except Exception:
-    _requests_missing = True
-    try:
-        w.show("AI 文字依赖 requests 缺失，请双击「修复环境.bat」", 12000)
-    except Exception:
-        pass
 c = companion.Companion(on_text=w.show, on_state=w.show)
-if _requests_missing:
-    c._dep_warned = True
 
 
 def _ensure_frida():
     """游戏在、但 logs/deck_live.json 不新鲜时，启动 frida_live。"""
     try:
-        import importlib.util
-        if singleton.frida_running():
-            return
         import shadow_warchess_reader as RW
-        pid, image = RW.find_game_pid()
+        pid, _ = RW.find_game_pid()
         if not pid:
             return
         p = os.path.join(HERE, "logs", "deck_live.json")
@@ -111,17 +49,12 @@ def _ensure_frida():
             fresh = False
         if fresh:
             return
-        international = os.path.basename(image).lower() in ("shadowversewb.exe", "shadowverseworldsbeyond.exe")
-        if not international and importlib.util.find_spec("frida") is None:
-            return
-        script = "international_reader.py" if international else "frida_live.py"
-        args = ["--pid", str(pid)] if international else [str(pid), "7200"]
         log = open(os.path.join(HERE, "logs", "frida_live.log"), "a",
                    encoding="utf-8")
         subprocess.Popen(
-            [sys.executable, "-u", os.path.join(HERE, script)] + args,
-            stdout=log, stderr=subprocess.STDOUT, cwd=HERE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            [sys.executable, "-u", os.path.join(HERE, "frida_live.py"),
+             str(pid), "7200"],
+            stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
     except Exception:
         pass
 
@@ -152,10 +85,10 @@ def tick():
     except Exception:
         pass
     try:
-        w.root.after(250, tick)
+        w.root.after(2000, tick)
     except Exception:
         pass
 
 
-w.root.after(250, tick)
+w.root.after(1500, tick)
 w.run()

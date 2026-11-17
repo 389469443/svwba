@@ -22,13 +22,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
 GAME = os.path.join(PKG, "dsh-shadowverse-huanjing")
 
-VERSION = "v1.1.3"
+VERSION = "v0.1.0"
 NAME = f"影之诗助手-{VERSION}"
 EN_NAME = f"svwba-{VERSION}"      # 英文名（导出/上传用）
 
 # svwb-probe 里运行必需的脚本
 PROBE_FILES = [
-    "一键出狱.py",             # 一键出狱（搜索并删除影之诗）
     "app.py",                      # 控制台（启动 + 两套独立设置）
     "panel_ui.py",                 # 战绩面板
     "leader_panel.py",             # 主战者效果面板
@@ -46,15 +45,9 @@ PROBE_FILES = [
     "read_rank.py",                # 读名次
     "cleanup.py",                  # 截图自动清理
     "setup_env.ps1",               # 首次启动：环境检查 / 自动安装（Python/Node/依赖）
-    "deps_check.py",               # 依赖检查（setup_env 调用：一次性检查缺哪个包）
     "ui_icon.py",                  # 窗口/托盘图标（assets/icon.png|ico）
     "ui_dpi.py",                   # DPI 感知（高清渲染）
     "collect_diag.py",             # 一键收集诊断信息（给测试者反馈 bug 用）
-    "international_reader.py",     # Steam 国际服读取器（BattleView 展示层定位）
-    "readonly_reader.py",          # 只读内存底层（国际服 / 记牌器共用）
-    "reader_supervisor.py",        # 读取器监管（国服 frida / 国际服自动切换）
-    "opponent_public.py",          # 对手公开信息（国际服快照扩展）
-    "frida_pair.py",               # Frida 配对说明（setup_env 调用）
     "meta_client.py",              # 阵容统计：服务器连接门控（未连接不收集/不显示）
     "meta_page.py",                # 阵容统计页
     "deck_reader.py",              # 影之诗：记牌器读取层（只读内存）
@@ -64,8 +57,6 @@ PROBE_FILES = [
     "companion.py",                # AI 陪玩（LLM/TTS）
     "companion_knowledge.json",    # AI 陪玩的影之诗黑话/梗知识库
     "ai_settings.py",              # AI 设置窗口
-    "upgrade_helper.py",           # 启动时检测旧版本：迁移数据 + 清理旧目录
-    "版本.txt",                    # 版本号（升级检测用）
     "pet_view.py",                 # 鲸鱼娘宠物窗口（Live2D）
     "run_companion.py",            # 宠物进程入口
     "parent_guard.py",             # 父进程守卫（控制台退出宠物也退）
@@ -102,7 +93,6 @@ def build(outdir):
     if os.path.isdir(target):
         shutil.rmtree(target)
     dirs = [
-        os.path.join(target, "svwb-probe", "assets"),
         os.path.join(target, "svwb-probe", "logs"),
         os.path.join(target, "svwb-probe", "hero-portraits"),
         os.path.join(target, "dsh-shadowverse-huanjing", "lib", "knowledge"),
@@ -135,13 +125,6 @@ def build(outdir):
         os.makedirs(dst_emo, exist_ok=True)
         for fn in os.listdir(emo):
             copy(os.path.join(emo, fn), os.path.join(dst_emo, fn))
-    # 宠物模型 / 表情 / 卡表（大资源，不在白名单里，必须整目录复制）
-    for _d in ("_l2d", "gamedata"):
-        _src = os.path.join(HERE, _d)
-        _dst = os.path.join(target, "svwb-probe", _d)
-        if os.path.isdir(_src):
-            shutil.copytree(_src, _dst, dirs_exist_ok=True)
-
     for f in LIB_FILES:
         copy(os.path.join(GAME, "lib", f),
              os.path.join(target, "dsh-shadowverse-huanjing", "lib", f))
@@ -167,8 +150,7 @@ def build(outdir):
         open(os.path.join(target, d, ".keep"), "w").close()
 
     # 打包必须是**原始设置**：清掉用户数据（API/卡组/战绩/宠物配置/日志）
-    for rel in ("HANDOFF.md", "更新记录.md",
-                "svwb-probe/gamedata/user_decks.json",
+    for rel in ("svwb-probe/gamedata/user_decks.json",
                 "svwb-probe/gamedata/user_deck.json",
                 "svwb-probe/pet_config.json",
                 "svwb-probe/companion.json",

@@ -16,9 +16,10 @@ import threading
 import time
 import tkinter as tk
 
-# ⚠️ keyboard 库会装全局低级键盘钩子，部分机器上会导致大多数按键失效
-# （用户 2026-11-07 反馈）。这里禁用全局钩子，只用窗口内 Tk 事件绑定。
-_keyboard = None
+try:
+    import keyboard as _keyboard
+except Exception:
+    _keyboard = None
 
 from PIL import Image, ImageTk
 
@@ -34,13 +35,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.path.join(HERE, "_l2d", "c_0120.model3.json")
 CONFIG = os.path.join(HERE, "pet_config.json")
 
-SIZES = (200, 260, 340, 480)
-DEFAULT_SIZE = 340
+SIZES = (200, 260, 340)
+DEFAULT_SIZE = 260
 # 宠物动画帧率：低 = 省 CPU/GPU（默认 12fps，用户 2026-10-29 反馈打字延迟）
 FPS_CHOICES = (8, 12, 24)
-DEFAULT_FPS = 24
+DEFAULT_FPS = 12
 KEY = "#010203"          # 透明色键
-BUBBLE_W = 260
+BUBBLE_W = 230
 BUBBLE_BG = "#1d2433"
 TEXT_FG = "#e8edf7"
 
@@ -107,9 +108,6 @@ class Renderer:
     def __init__(self, w, h, model_path=None, fps=DEFAULT_FPS):
         self.w = w
         self.h = h
-        # 2x 超采样（GPU 渲染 2 倍 → CPU BILINEAR 缩小显示，边缘更锐利）
-        self.render_w = max(w, int(w * 2))
-        self.render_h = max(h, int(h * 2))
         self.fps = max(1, int(fps))
         self.model_path = model_path or MODEL
         self.latest = None
@@ -136,13 +134,13 @@ class Renderer:
         try:
             pygame.init()
             pygame.display.set_mode(
-                (self.render_w, self.render_h),
+                (self.w, self.h),
                 pygame.OPENGL | pygame.HIDDEN | pygame.DOUBLEBUF)
             live2d.init()
             live2d.glInit()
             model = live2d.Model()
             model.LoadModelJson(self.model_path)
-            model.Resize(self.render_w, self.render_h)
+            model.Resize(self.w, self.h)
             # 注册模型目录下的 motions/*.motion3.json（组名=文件名）
             mdir = os.path.join(os.path.dirname(self.model_path), "motions")
             if os.path.isdir(mdir):
@@ -175,7 +173,7 @@ class Renderer:
             print("render init err:", e, flush=True)
             return
 
-        w, h = self.render_w, self.render_h
+        w, h = self.w, self.h
         while not self._stop:
             try:
                 pending = None
@@ -211,8 +209,6 @@ class Renderer:
                 buf = glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE)
                 im = Image.frombytes("RGBA", (w, h), buf).transpose(
                     Image.FLIP_TOP_BOTTOM)
-                if (w, h) != (self.w, self.h):
-                    im = im.resize((self.w, self.h), Image.BILINEAR)
                 with self.lock:
                     self.latest = im
                 self.frames += 1
@@ -270,9 +266,6 @@ class PetView:
         self._hide_after = None
         self._menu = tk.Menu(self.root, tearoff=0)
 
-        self.obs_canvas = None
-        import stream_settings
-        stream_settings.watch(self.root, self._stream_mode)
         self._build(self.size)
         self.root.bind("<Button-1>", self._press)
         self.root.bind("<B1-Motion>", self._drag_move)
@@ -288,34 +281,6 @@ class PetView:
         # 监听 pet_config.json：AI 设置里改「模型大小」保存后立即生效（用户 2026-10-29 要求）
         self._cfg_mtime = 0
         self._watch_config()
-
-    def _auto_expression(self):
-        """空闲时自动换一个原生表情，避免长时间同一张脸。
-
-        第一次调用只启动计时器；之后每 30~45 秒检查一次：
-        气泡正在说话（AI 刚回复或用户在戳）时跳过，避免抢戏。
-        """
-        try:
-            if getattr(self, "_auto_expr_started", False):
-                now = time.time()
-                try:
-                    bubble_on = (self.canvas.itemcget(self._bubble_text, "state")
-                                 == "normal")
-                except Exception:
-                    bubble_on = False
-                if (not bubble_on
-                        and now - getattr(self, "_play_at", 0.0) > 12.0):
-                    names = self._expr_names()
-                    if names:
-                        import random
-                        with self.renderer.lock:
-                            self.renderer.pending_expr = random.choice(names)
-            self._auto_expr_started = True
-            import random
-            self.root.after(30000 + random.randint(0, 15000),
-                            self._auto_expression)
-        except Exception:
-            pass
 
     def _force_topmost(self):
         """Tk 的 -topmost 有时会被全屏游戏盖住，这里用 Win32 强制置顶。"""
@@ -369,7 +334,7 @@ class PetView:
             state="hidden")
         self._bubble_text = self.canvas.create_text(
             self.w + 18, 30, anchor="nw", text="", fill=TEXT_FG,
-            font=("Microsoft YaHei UI", 11), width=BUBBLE_W - 28,
+            font=("Microsoft YaHei UI", 9), width=BUBBLE_W - 28,
             justify="left", state="hidden")
         # 表情包（被戳时偶尔甩一张，本地图不耗 API）
         self._emote_photo = None
@@ -389,9 +354,6 @@ class PetView:
                 at = float(d.get("at") or 0)
                 if at > getattr(self, "_cmd_at", 0):
                     self._cmd_at = at
-                    line = (d.get("say") or "").strip()
-                    if line:
-                        self.show(line, 8000)
                     name = (d.get("action") or "").strip()
                     if name:
                         self._play_expression(name)
@@ -436,8 +398,6 @@ class PetView:
             if im is not None:
                 self._photo = ImageTk.PhotoImage(im)
                 self.canvas.itemconfig(self._img_item, image=self._photo)
-            if self.obs_canvas is not None:
-                self._sync_obs_canvas()
         except Exception:
             pass
         try:
@@ -541,6 +501,9 @@ class PetView:
                 pers = companion.load_config().get("personality") or "gentle"
             except Exception:
                 pers = "gentle"
+            # 约 1/3 概率甩一张表情包（本地图）
+            if random.random() < 0.33 and self._show_emote():
+                return
             if pers == "toxic":
                 lines = POKE_LINES_TOXIC
             elif pers == "tsundere":
@@ -588,56 +551,12 @@ class PetView:
             pass
 
     # ---------------- 右键菜单 ----------------
-    def _stream_mode(self, enabled):
-        if enabled:
-            self._open_obs_window()
-        elif self.obs_canvas is not None:
-            self._close_obs_window()
-
-    def _open_obs_window(self):
-        if self.obs_canvas is not None:
-            self.obs_canvas.master.deiconify()
-            self.obs_canvas.master.lift()
-            return
-        win = tk.Toplevel(self.root)
-        win.title("影之诗 · 宠物和气泡")
-        win.resizable(False, False)
-        win.protocol("WM_DELETE_WINDOW", self._close_obs_window)
-        canvas = tk.Canvas(win, bg=KEY, bd=0, highlightthickness=0)
-        canvas.pack()
-        self.obs_canvas = canvas
-        self.obs_items = (
-            canvas.create_image(0, 0, anchor="nw"),
-            canvas.create_image(0, 0, anchor="nw"),
-            canvas.create_text(0, 0, anchor="nw", fill=TEXT_FG,
-                               font=("Microsoft YaHei UI", 11), width=BUBBLE_W - 28,
-                               justify="left"),
-            canvas.create_image(0, 0, anchor="nw"),
-        )
-        self._sync_obs_canvas()
-
-    def _sync_obs_canvas(self):
-        canvas = self.obs_canvas
-        canvas.configure(width=self.total_w, height=self.h)
-        for src, dest, option in zip(
-                (self._img_item, self._bubble_bg, self._bubble_text, self._emote_item),
-                self.obs_items, ("image", "image", "text", "image")):
-            canvas.coords(dest, *self.canvas.coords(src))
-            canvas.itemconfigure(dest, state=self.canvas.itemcget(src, "state"),
-                                 **{option: self.canvas.itemcget(src, option)})
-
-    def _close_obs_window(self):
-        win = self.obs_canvas.master
-        self.obs_canvas = None
-        win.destroy()
-
     def _menu_popup(self, ev):
         m = self._menu
         m.delete(0, "end")
         m.add_command(
             label=("解锁位置" if self.locked else "锁定位置"),
             command=self._toggle_lock)
-        m.add_command(label="显示 OBS 采集窗口", command=self._open_obs_window)
         m.add_command(label="打开控制台", command=self._open_console)
         m.add_separator()
         m.add_command(label="关闭", command=self.close)
@@ -730,7 +649,10 @@ class PetView:
             if parent_guard.running():
                 import ctypes
                 u = ctypes.windll.user32
-                for title in ("影之诗助手", "影之幻境 · 控制台"):
+                # 包体已改名为「影之诗助手汉萨改」，旧名一并留着，
+                # 免得老版本的窗口找不到。
+                for title in ("影之诗助手汉萨改", "影之诗助手",
+                              "影之幻境 · 控制台"):
                     hwnd = u.FindWindowW(None, title)
                     if hwnd:
                         u.ShowWindow(hwnd, 9)      # SW_RESTORE

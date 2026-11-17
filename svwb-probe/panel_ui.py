@@ -345,9 +345,6 @@ class Panel:
 
         root.title("影之幻境 · 战绩")
         root.overrideredirect(True)
-        self._streaming = False
-        import stream_settings
-        stream_settings.watch(root, self._set_stream_mode)
         import game_win as _GW
         root.attributes("-topmost", False)
         _opaque = os.environ.get("PANEL_OPAQUE") == "1"
@@ -519,23 +516,9 @@ class Panel:
         d = getattr(ui_dpi, "SCALE", 1.0)
         return (int((300 + extra_w) * sc * d), int(340 * sc * d))
 
-    def _set_stream_mode(self, enabled):
-        if self._streaming == enabled:
-            return
-        self._streaming = enabled
-        self.root.overrideredirect(not enabled)
-        self.root.attributes("-transparentcolor", "" if enabled else (CHROMA if os.environ.get("PANEL_OPAQUE") != "1" else ""))
-        self._apply_alpha()
-        if enabled:
-            import stream_settings
-            self.root.update_idletasks()
-            stream_settings.capture_style(self.root)
-        else:
-            self._apply_style()
-
     def _apply_alpha(self):
         try:
-            self.root.attributes("-alpha", 1.0 if self._streaming else self._alpha)
+            self.root.attributes("-alpha", self._alpha)
         except Exception:
             pass
 
@@ -786,10 +769,6 @@ class Panel:
         return h or self.root.winfo_id()
 
     def _apply_style(self):
-        if self._streaming:
-            import stream_settings
-            stream_settings.capture_style(self.root)
-            return
         try:
             import ctypes
             user32 = ctypes.windll.user32
@@ -818,7 +797,7 @@ class Panel:
             #    对策：先抖一下（设成略不同的值），再把真实值设回去，强制重发。
             try:
                 self.root.attributes("-alpha", max(0.0, float(self._alpha) - 0.01))
-                self.root.attributes("-alpha", 1.0 if self._streaming else float(self._alpha))
+                self.root.attributes("-alpha", float(self._alpha))
             except Exception:
                 pass
             try:

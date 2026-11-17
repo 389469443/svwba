@@ -53,6 +53,59 @@ DEFAULT_LEADER = {"w": 320, "h": 160, "locked": False,
                   "alpha": 0.90, "font_size": 9}
 CONSOLE_POS = os.path.join(LOGS, "console-pos.json")
 CONSOLE_SET = os.path.join(LOGS, "console-settings.json")
+READER_STATUS = os.path.join(LOGS, "reader_status.json")
+
+
+def write_reader_status(why, pid=0, note=""):
+    """把「实时读取为什么没起来」写进 logs/reader_status.json。
+
+    2026-11-13：只装在 frida_live 里是不够的 —— 没找到游戏进程时，这里
+    （控制台的看护逻辑）在**拉起 frida_live 之前就 return 了**，读取器根本
+    没跑过，也就没人写这个文件，界面还是只剩一句「读取未启动」。
+    所以这条路径也要落一份，记牌器才知道死在哪一步。
+    """
+    try:
+        os.makedirs(LOGS, exist_ok=True)
+        tmp = READER_STATUS + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"why": why, "pid": int(pid or 0), "note": note,
+                       "at": int(time.time() * 1000)}, fh,
+                      ensure_ascii=False)
+        os.replace(tmp, READER_STATUS)
+    except Exception:
+        pass
+
+# ---- 实时读取（frida_live）的看护参数 -------------------------------------
+# 以前是「8 秒没刷新就重启」，可 JS 注进去到第一帧快照本来就要几秒，
+# 结果读取器还没热身就被判成失联，于是 12 秒一轮地 attach/detach，
+# 每轮都在游戏进程里挂一次又拆一次 hook —— 用户关游戏时正好撞上，直接卡死。
+LIVE_GRACE_S = 30.0      # 刚拉起的读取器，这么久之内不看快照新鲜度
+LIVE_STALE_S = 45.0      # 快照超过这么久没刷新，才当成「活着但不出数」
+MIN_GAME_AGE = 15.0      # 游戏进程至少活了这么久才允许注入
+
+
+def frida_stale(started_at, mtime, now=None):
+    """读取器是不是「活着但不出数」。
+
+    started_at —— 本次拉起的时刻（0 表示不知道）
+    mtime      —— logs/deck_live.json 的修改时间（0 表示从来没写过）
+    """
+    now = time.time() if now is None else now
+    if started_at and (now - started_at) < LIVE_GRACE_S:
+        return False           # 刚起来，JS 还在注入 / 还没打第一局，别急着判死
+    if not mtime:
+        # 一帧快照都没写过。
+        # 探针正常跑着的话，**空闲也会周期性写 idle 快照**（frida_live 里
+        # `json.dump({"idle": True, ...})` 那段），所以「知道它什么时候起的、
+        # 过了宽限期还一帧都没有」基本就是卡住了。
+        # 2026-11-11：先开会助手后开游戏那次，探针从头到尾没写过 deck_live.json，
+        # 而这里一直返回 False（当正常待机）→ 上层永远不重启 → 界面永远「读取未启动」。
+        # 不知道启动时刻（外部拉起的）就仍然不折腾，避免误判。
+        if started_at:
+            return (now - started_at) > LIVE_GRACE_S
+        return False
+    return (now - mtime) > LIVE_STALE_S
+
 
 # 控制台自己的设置：关闭行为 / 不透明度 / 字号 / 面板大小
 # running：上次关闭时各子进程是否在运行（首次没有这个键 → 全部关闭）
@@ -61,7 +114,6 @@ SNAPSHOT_FILES = (
     os.path.join(LOGS, "deck_live.json.tmp"),
 )
 SNAPSHOT_MAX_AGE_SEC = 3600
-
 
 def cleanup_snapshots(force=False):
     """清理超过一小时的临时读取快照；force 用于真正退出时删除当前快照。"""
@@ -194,28 +246,17 @@ _WNDPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.wintypes.HWND,
 
 
 
-_ABOVE_CACHE = {"at": 0.0, "val": True}
-
-
 def _above_game():
     """
     控制台是否应该置顶：**只在游戏窗口位于前台时**才置顶。
 
     用户要求：面板只显示在游戏上面，不要显示在所有窗口最上面。
-    1 秒缓存：面板大小/字号拖动时会频繁调用，每次枚举窗口会卡。
     """
-    import time as _t
-    now = _t.time()
-    if now - _ABOVE_CACHE["at"] < 1.0:
-        return _ABOVE_CACHE["val"]
     try:
         import game_win as _GW
-        val = bool(_GW.game_is_foreground())
+        return bool(_GW.game_is_foreground())
     except Exception:
-        val = True
-    _ABOVE_CACHE["at"] = now
-    _ABOVE_CACHE["val"] = val
-    return val
+        return True
 
 
 
@@ -654,7 +695,7 @@ class App:
         # 之前做成无边框（overrideredirect）后既不能拖动也不能关闭，
         # 用户完全失去对它的控制 —— 控制类窗口必须能移动和关闭。
         # 这里只做"半透明 + 深色主题"，不加抠色、不加无边框。
-        root.title("影之诗助手")
+        root.title("影之诗助手汉萨改")
         # 无边框 + 自绘标题行（用户要求标题那块不要系统标题栏）
         root.overrideredirect(True)
         root.attributes("-topmost", _above_game())
@@ -722,7 +763,7 @@ class App:
 
         vrow = tk.Frame(self.pad, bg=BG)
         vrow.pack()
-        tk.Label(vrow, text="v1.1.3  控制台", bg=BG, fg=GOLD2,
+        tk.Label(vrow, text="v0.1.0  控制台", bg=BG, fg=GOLD2,
                  font=self.f_s).pack(side="left")
         tk.Button(vrow, text="⚙ 设置", command=self.open_console_settings,
                   bg=BG, fg=GOLD, relief="flat", bd=0, padx=6,
@@ -762,7 +803,13 @@ class App:
         self._group("胜率悬浮层", "overlay", self.open_overlay_settings)
         self._group("战绩面板", "panel", self.open_panel_settings)
         self._group("悬浮窗", "leader", self.open_leader_settings)
-        self._meta_group()
+        # 阵容统计：**只有连接服务器后**才出现入口（用户 2026-10-19 要求）。
+        # 没连上时这里什么都不建，统计页也就打不开。
+        try:
+            if meta_client.available():
+                self._meta_group()
+        except Exception:
+            pass
 
         tk.Frame(self.page_hj, bg=RULE, height=1).pack(fill="x", padx=14, pady=8)
         row = tk.Frame(self.page_hj, bg=BG)
@@ -1006,6 +1053,28 @@ class App:
             self.root.destroy()
         except Exception:
             pass
+        # 兜底硬出口。
+        # 2026-11-11 用户一晚上攒了三个 pythonw：窗口和托盘都消失了，进程却
+        # 还在后台跑着 mainloop —— 每个都在跑自己的 _tick、都去抢着注入游戏，
+        # 结果谁也连不上、游戏还卡顿。单实例锁也没拦住（旧进程还没死透）。
+        #
+        # 正常情况这里根本跑不到（mainloop 返回 → main() 收尾 → 进程就退了）；
+        # 只要 1.5 秒后还活着，说明 Tk 没被销毁干净，直接硬退。
+        def _hard_exit():
+            time.sleep(1.5)
+            try:
+                import parent_guard
+                parent_guard.clear_pid()
+            except Exception:
+                pass
+            try:
+                os._exit(0)
+            except Exception:
+                pass
+        try:
+            threading.Thread(target=_hard_exit, daemon=True).start()
+        except Exception:
+            pass
 
     def _hwnd(self):
         """
@@ -1119,7 +1188,13 @@ class App:
         这里按命令行特征扫一遍，杀掉不属于当前进程树的那几个。
         """
         me = os.getpid()
-        pat = r"overlay\.py|panel_ui\.py|leader_panel\.py"
+        # 2026-11-11：把 app.py（控制台自己）也算进来。
+        # 用户晚上遇到「三次启动留下三个 pythonw」——它们各自跑着自己的 _tick、
+        # 各自去抢着注入游戏，结果谁都连不上、游戏还卡顿。
+        # 单实例锁本该挡住，但它们是在「旧进程还没死透」的窗口里起来的，没拦住。
+        # 启动时按命令行把旧的收掉最保险；-ne $me 保证不会杀掉自己。
+        pat = (r"overlay\.py|panel_ui\.py|leader_panel\.py|watch_mem\.py"
+               r"|app\.py")
         ps = ("Get-CimInstance Win32_Process -Filter "
               "\"Name='python.exe' or Name='pythonw.exe'\" | "
               "Where-Object { $_.CommandLine -match '%s' -and $_.ProcessId -ne %d } | "
@@ -1179,9 +1254,11 @@ class App:
         tk.Button(right, text="打开", command=self.open_deck_tracker, bg=BG,
                   fg=GOLD, relief="flat", bd=0, padx=10, pady=4,
                   font=self.f_s, cursor="hand2").pack(side="right")
-        tk.Button(right, text="设置", command=self.open_tracker_settings, bg=BG,
-                  fg=GOLD2, relief="flat", bd=0, padx=8, pady=4,
-                  font=self.f_s, cursor="hand2").pack(side="right", padx=4)
+        # 历史胜率（2026-11-09）：记牌器的胜率是「本次」的，这里看按卡组 × 按天的账
+        tk.Button(right, text="历史胜率", command=self.open_win_history,
+                  bg=BG, fg=GOLD2, relief="flat", bd=0, padx=8, pady=4,
+                  font=self.f_s, cursor="hand2").pack(side="right",
+                                                     padx=(0, 4))
         tk.Frame(p, bg=RULE, height=1).pack(fill="x", padx=14, pady=6)
 
         # AI 陪玩（语音助手）：设置和记牌器同页，但独立入口
@@ -1226,7 +1303,58 @@ class App:
                   font=self.f_s, cursor="hand2").pack(side="right",
                                                       padx=(0, 4))
         self._refresh_deck_status()
-        # v1.1.3：不提供卡牌台词字幕（阉割版）
+
+        # 卡图（2026-11-07）：官方卡表给图片名，官方图床给图，本地只存缩略图
+        box4 = tk.Frame(p, bg=BG2)
+        box4.pack(fill="x", padx=12, pady=4)
+        left4 = tk.Frame(box4, bg=BG2)
+        left4.pack(side="left", fill="x", expand=True, padx=8, pady=6)
+        self.art_var = tk.BooleanVar(value=True)
+        try:
+            import cardart
+            self.art_var.set(bool(cardart.enabled()))
+        except Exception:
+            pass
+        tk.Checkbutton(left4, text="记牌器里显示卡牌图片",
+                       variable=self.art_var, command=self._toggle_art,
+                       bg=BG2, fg=FG, selectcolor=BG, activebackground=BG2,
+                       activeforeground=GOLD, font=self.f_s, bd=0,
+                       highlightthickness=0, anchor="w",
+                       cursor="hand2").pack(fill="x")
+        self.art_status = tk.Label(left4, text="", bg=BG2, fg=DIM,
+                                   font=self.f_s, anchor="w")
+        self.art_status.pack(fill="x")
+        right4 = tk.Frame(box4, bg=BG2)
+        right4.pack(side="right", padx=8, pady=6)
+        tk.Button(right4, text="清理缓存", command=self._clear_art,
+                  bg=BG, fg=GOLD2, relief="flat", bd=0, padx=8, pady=4,
+                  font=self.f_s, cursor="hand2").pack(side="right",
+                                                      padx=(0, 4))
+        tk.Button(right4, text="下载当前卡组", command=self._prefetch_art,
+                  bg=BG, fg=GOLD, relief="flat", bd=0, padx=8, pady=4,
+                  font=self.f_s, cursor="hand2").pack(side="right",
+                                                      padx=(0, 4))
+        self._refresh_art_status()
+        # 2026-11-15 用户反馈：卡片图鉴里明明已经有卡图了，这里还写着
+        # 「已缓存 0 个尺寸文件（0.0 MB）」—— 因为这一行**只在打开这个页时
+        # 算一次**，而卡图是后台线程一张张下载落盘的，之后没人再算。
+        # 现在只要这行还显示着，就每 4 秒重算一次。
+        self._art_tick_on = True
+        self._art_tick()
+
+    def _art_tick(self):
+        """缓存计数定时刷新（只在标签可见时算，页面切走就空转）。"""
+        try:
+            if (getattr(self, "_art_tick_on", False)
+                    and self.art_status.winfo_exists()
+                    and self.art_status.winfo_ismapped()):
+                self._refresh_art_status()
+        except Exception:
+            pass
+        try:
+            self.root.after(4000, self._art_tick)
+        except Exception:
+            pass
 
     # ---------------- 卡组（导入卡组码 / 查看 / 切换当前） ----------------
     def _toplevel(self, title, geometry=None, alpha=0.9):
@@ -1270,6 +1398,97 @@ class App:
         except Exception:
             pass
 
+    # ---------------- 卡图（2026-11-07） ----------------
+    def _active_deck_cards(self):
+        """当前卡组的卡 id 列表（预下载卡图用）。"""
+        try:
+            with open(self._decks_path(), encoding="utf-8") as fh:
+                d = json.load(fh)
+            decks = d.get("decks") or []
+            active = d.get("active") or ""
+            item = next((x for x in decks if x.get("name") == active),
+                        decks[0] if decks else {})
+            return list((item or {}).get("cards") or [])
+        except Exception:
+            return []
+
+    def _refresh_art_status(self):
+        try:
+            import cardart
+        except Exception:
+            try:
+                self.art_status.config(text="卡图模块不可用")
+            except Exception:
+                pass
+            return
+        try:
+            n = cardart.cached_count()
+            mb = cardart.cache_size_mb()
+            txt = "已缓存 %d 个尺寸文件（%.1f MB）· 首次看到一张卡会后台下它的图" \
+                  % (n, mb)
+        except Exception:
+            txt = ""
+        try:
+            self.art_status.config(text=txt)
+        except Exception:
+            pass
+
+    def _toggle_art(self):
+        try:
+            import cardart
+            cardart.set_enabled(bool(self.art_var.get()))
+        except Exception:
+            pass
+        self._refresh_art_status()
+
+    def _prefetch_art(self):
+        """把当前卡组的卡图先下好（后台线程，不卡控制台）。"""
+        cards = self._active_deck_cards()
+        if not cards:
+            try:
+                self.art_status.config(text="还没有导入卡组")
+            except Exception:
+                pass
+            return
+        try:
+            self.art_status.config(text="正在下载当前卡组卡图…（可以关掉这个窗口）")
+        except Exception:
+            pass
+
+        def work():
+            import cardart
+            for c in cards:
+                try:
+                    cardart.get(c, cardart.ROW_PX)
+                except Exception:
+                    pass
+            t0 = time.time()
+            while time.time() - t0 < 240:
+                try:
+                    if not cardart.stats().get("queued"):
+                        break
+                except Exception:
+                    break
+                time.sleep(0.4)
+            try:
+                self.root.after(0, self._refresh_art_status)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clear_art(self):
+        try:
+            import cardart
+            n = cardart.clear_cache()
+        except Exception:
+            n = 0
+        self._refresh_art_status()
+        try:
+            self.art_status.config(text="已清理 %d 个缓存文件" % n)
+        except Exception:
+            pass
+
     def _save_active_deck(self, name):
         p = self._decks_path()
         try:
@@ -1279,12 +1498,46 @@ class App:
             return
         d["active"] = name
         d["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        # 先归档再落盘：归档要知道「这段数字是哪个卡组的」，而磁盘上此刻
+        # 的 active 还是旧卡组（写完之后就查不到了）。
+        self._archive_winrate(name, "切换卡组")
         os.makedirs(os.path.dirname(p), exist_ok=True)
         tmp = p + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(d, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, p)
         self._refresh_deck_status()
+
+    def _archive_winrate(self, active, why):
+        """把记牌器里这一段胜率归档到（旧卡组, 所属日期），然后清零。
+
+        切卡组 / 跨天 / 打开面板前都会走这里；失败只打印，不影响换卡组。
+        """
+        try:
+            import win_history
+            ev = win_history.sync(active=active)
+        except Exception as e:
+            print("历史胜率归档失败：%s" % e)
+            return None
+        if not ev:
+            return None
+        if ev.get("cleared"):
+            spread = "、".join("%s %d胜%d负" % (d["day"][5:], d["wins"],
+                                               d["losses"])
+                               for d in ev["days"])
+            # 原因按**实际触发条件**说，不照抄调用方那句话：手动切卡组时是
+            # `_save_active_deck` 直接归档，而定时检查那一拍也可能是「卡组文件
+            # 被别人改了」才发现的切换 —— 那时 why 还写着「跨天归档」，
+            # 日志就会说反（用户 2026-11-09 实测时撞到过）。
+            tags = []
+            if ev.get("switched"):
+                tags.append("切卡组")
+            if ev.get("rolled"):
+                tags.append("跨天")
+            print("历史胜率：%s →「%s」归档 %s（%s），记牌器胜率已清零"
+                  % (why, ev["deck"], spread,
+                     "+".join(tags) if tags else why), flush=True)
+        return ev
 
     def _delete_deck(self, name):
         """删除一套卡组；删的是当前卡组时，active 切到剩下的第一套。"""
@@ -1300,6 +1553,8 @@ class App:
         if (d.get("active") or "") == name:
             d["active"] = (decks[0].get("name") or "") if decks else ""
         d["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        # 删掉当前卡组时 active 会自动换人：也当成一次切卡组（先归档再落盘）
+        self._archive_winrate(d.get("active") or "", "切换卡组")
         os.makedirs(os.path.dirname(p), exist_ok=True)
         tmp = p + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -1319,7 +1574,6 @@ class App:
         hit = False
         for x in decks:
             if (x.get("name") or "") == old:
-                x.setdefault("stats_id", "name:" + old)
                 x["name"] = new
                 hit = True
         if not hit:
@@ -1334,6 +1588,13 @@ class App:
             json.dump(d, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, p)
         self._refresh_deck_status()
+        # 改名：历史记录的钥匙跟着换（先换钥匙，再走归档）
+        try:
+            import win_history
+            win_history.rename_deck(old, new)
+        except Exception as e:
+            print("历史胜率改名失败：%s" % e)
+        self._archive_winrate(new, "重命名卡组")
 
     def open_deck_import(self):
         """导入卡组码：贴码 → 解析预览 → 保存到 user_decks.json。"""
@@ -1385,9 +1646,10 @@ class App:
             _show("\n".join(lines))
 
         def _save():
-            _parse()
             if not state["entries"]:
-                return
+                _parse()
+                if not state["entries"]:
+                    return
             name = state["name"] or "导入的卡组"
             cards = []
             for cid, n in state["entries"]:
@@ -1401,11 +1663,7 @@ class App:
                     d = {"decks": []}
                 decks = [x for x in (d.get("decks") or [])
                          if x.get("name") != name]
-                import uuid
-                previous = next((x for x in d.get("decks", []) if x.get("name") == name), None)
-                stats_id = ((previous.get("stats_id") or "name:" + name) if previous
-                            else uuid.uuid4().hex)
-                decks.insert(0, {"name": name, "cards": cards, "stats_id": stats_id})
+                decks.insert(0, {"name": name, "cards": cards})
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 tmp = p + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as fh:
@@ -1457,7 +1715,7 @@ class App:
         except Exception:
             meta = {}
 
-        win = self._toplevel("已导入的卡组", "760x680")
+        win = self._toplevel("已导入的卡组", "560x640")
         canvas = tk.Canvas(win, bg=BG, highlightthickness=0)
         scroll = tk.Scrollbar(win, command=canvas.yview)
         inner = tk.Frame(canvas, bg=BG)
@@ -1499,154 +1757,11 @@ class App:
             win.destroy()
             self.open_deck_list()
 
-        def _show_code(name, text, copied=False):
-            """卡组码窗口：进来就已经复制好了。"""
-            w = self._toplevel("卡组码 · %s" % name, "620x400")
-            tip = ("✅ 已复制到剪贴板，直接在游戏里【卡牌】→【新牌组】→"
-                   "【使用牌组码】粘贴" if copied else
-                   "复制下面的整段，在游戏里【卡牌】→【新牌组】→"
-                   "【使用牌组码】粘贴")
-            tk.Label(w, text=tip, bg=BG, fg=(GREEN if copied else DIM),
-                     font=self.f_s, anchor="w", justify="left",
-                     wraplength=570).pack(fill="x", padx=12, pady=(8, 4))
-            box = tk.Text(w, bg=BG2, fg=FG, font=("Consolas", 9),
-                          wrap="word", relief="flat", bd=0, padx=8, pady=8,
-                          insertbackground=FG, height=13)
-            box.pack(fill="both", expand=True, padx=12, pady=4)
-            box.insert("1.0", text)
-            box.config(state="disabled")
-
-            def _again():
-                from tkinter import messagebox
-                if _copy_text(text):
-                    messagebox.showinfo("已复制", "卡组码已复制到剪贴板",
-                                        parent=w)
-                else:
-                    messagebox.showerror("复制失败",
-                                         "自动复制失败了，请手动全选文本框里的内容复制",
-                                         parent=w)
-
-            bar = tk.Frame(w, bg=BG)
-            bar.pack(fill="x", padx=12, pady=(0, 10))
-            tk.Button(bar, text="再复制一次", command=_again, bg=GOLD,
-                      fg="#1a1209", relief="flat", bd=0, padx=14, pady=5,
-                      font=self.f_s, cursor="hand2").pack(side="right")
-            tk.Button(bar, text="关闭", command=w.destroy, bg=BG2, fg=DIM,
-                      relief="flat", bd=0, padx=14, pady=5,
-                      font=self.f_s, cursor="hand2").pack(
-                side="right", padx=6)
-
-        def _build_code(name, cards):
-            """生成卡组码文本（导出和复制共用）。"""
-            import deckcode
-            try:
-                meta = deck_reader.load_meta()
-            except Exception:
-                meta = {}
-            from collections import Counter as _Counter
-            cls = None
-            for _code, _cname in deckcode.CLASSES.items():
-                if _cname in name:
-                    cls = _code
-                    break
-            if cls is None:
-                cls_cnt = _Counter()
-                for cid in cards:
-                    info = meta.get(str(cid)) or {}
-                    k = info.get("class")
-                    if isinstance(k, int) and 1 <= k <= 7:
-                        cls_cnt[k] += 1
-                cls = cls_cnt.most_common(1)[0][0] if cls_cnt else 3
-            mode = 1
-            entries = [(cid, n) for cid, n in _Counter(cards).items()]
-            line = deckcode.encode(entries, "%d.%d" % (mode, cls))
-            return chr(10).join([
-                "#%s#" % name,
-                "#%s#" % deckcode.MODES.get(mode, "指定系列"),
-                "#%s#" % deckcode.CLASSES.get(cls, "巫师"),
-                line,
-                "#在游戏中点击【卡牌】-【新牌组】-【使用牌组码】进行粘贴 #",
-            ])
-
-        def _copy_text(text):
-            """复制到剪贴板。先用 Tk，失败再直接用 Win32（不依赖窗口焦点）。"""
-            try:
-                win.clipboard_clear()
-                win.clipboard_append(text)
-                win.update()
-                if win.clipboard_get() == text:
-                    return True
-            except Exception:
-                pass
-            try:
-                import ctypes
-                from ctypes import wintypes
-                u = ctypes.windll.user32
-                k = ctypes.windll.kernel32
-                k.GlobalAlloc.restype = ctypes.c_void_p
-                k.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
-                k.GlobalLock.restype = ctypes.c_void_p
-                k.GlobalLock.argtypes = [ctypes.c_void_p]
-                k.GlobalUnlock.argtypes = [ctypes.c_void_p]
-                k.GlobalFree.argtypes = [ctypes.c_void_p]
-                u.SetClipboardData.restype = ctypes.c_void_p
-                u.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
-                data = text.encode("utf-16-le") + bytes(2)
-                h = k.GlobalAlloc(0x0002 | 0x0040, len(data))
-                if not h:
-                    return False
-                p = k.GlobalLock(h)
-                if not p:
-                    k.GlobalFree(h)
-                    return False
-                ctypes.memmove(p, data, len(data))
-                k.GlobalUnlock(h)
-                if not u.OpenClipboard(None):
-                    return False
-                try:
-                    u.EmptyClipboard()
-                    return bool(u.SetClipboardData(13, h))
-                finally:
-                    u.CloseClipboard()
-            except Exception:
-                return False
-
-        def _export(name, cards):
-            """导出卡组码：直接复制到剪贴板，并打开窗口方便核对。"""
-            from tkinter import messagebox
-            try:
-                text = _build_code(name, cards)
-            except Exception as e:
-                messagebox.showerror("导出失败", str(e), parent=win)
-                return
-            copied = _copy_text(text)
-            _show_code(name, text, copied)
-
         from collections import Counter
         if not decks:
-            tk.Label(inner,
-                     text="还没有导入卡组。" + chr(10) * 2 +
-                          "点「导入卡组码」粘贴游戏里生成的卡组码即可。",
+            tk.Label(inner, text="还没有导入卡组。\n\n点「导入卡组码」粘贴游戏里生成的卡组码即可。",
                      bg=BG, fg=DIM, font=self.f_s, justify="left",
                      anchor="w").pack(fill="x", padx=8, pady=10)
-        import battle_stats
-        from tkinter import messagebox
-        stat_labels = {}
-
-        def refresh_stats():
-            totals = battle_stats.deck_counts()
-            for key, label in stat_labels.items():
-                counts = totals.get(key, {})
-                wins, losses = counts.get("wins", 0), counts.get("losses", 0)
-                total = wins + losses
-                rate = "%.1f%%" % (wins * 100 / total) if total else "—"
-                label.config(text=f"使用胜率 {rate}    {total} 场 · {wins} 胜 · {losses} 负")
-
-        def reset_stats(key, name):
-            if messagebox.askyesno("清零卡组战绩", f"清零「{name}」的使用战绩？", parent=win):
-                battle_stats.reset_deck(key)
-                refresh_stats()
-
         for x in decks:
             name = x.get("name") or "?"
             cards = x.get("cards") or []
@@ -1661,11 +1776,6 @@ class App:
                       bg=BG, fg=GOLD2, relief="flat", bd=0, padx=8,
                       pady=3, font=self.f_s, cursor="hand2").pack(
                 side="right", padx=(0, 4))
-            tk.Button(top, text="导出码",
-                      command=lambda n=name, c=list(cards): _export(n, c),
-                      bg=BG, fg=GOLD, relief="flat", bd=0, padx=8,
-                      pady=3, font=self.f_s, cursor="hand2").pack(
-                side="right", padx=(0, 4))
             tk.Button(top, text="删除", command=lambda n=name: _delete(n),
                       bg=BG, fg=RED, relief="flat", bd=0, padx=8,
                       pady=3, font=self.f_s, cursor="hand2").pack(
@@ -1678,14 +1788,6 @@ class App:
                           bg=BG, fg=GOLD, relief="flat", bd=0, padx=10,
                           pady=3, font=self.f_s, cursor="hand2").pack(
                     side="right")
-            stats_row = tk.Frame(row, bg=BG2)
-            stats_row.pack(fill="x", padx=8, pady=(0, 4))
-            key = battle_stats.deck_key(x)
-            label = tk.Label(stats_row, bg=BG2, fg=GOLD, font=self.f_s, anchor="w")
-            label.pack(side="left")
-            stat_labels[key] = label
-            tk.Button(stats_row, text="清零战绩", command=lambda k=key, n=name: reset_stats(k, n),
-                      bg=BG, fg=DIM, relief="flat", font=self.f_s).pack(side="right")
             detail = "  ".join(
                 "%s×%d" % ((meta.get(str(cid)) or {}).get("name")
                            or ("#%d" % cid), n)
@@ -1693,52 +1795,43 @@ class App:
             tk.Label(row, text=detail, bg=BG2, fg=DIM, font=self.f_s,
                      wraplength=500, justify="left", anchor="w").pack(
                 fill="x", padx=8, pady=(0, 6))
-        refresh_stats()
         bar = tk.Frame(win, bg=BG)
         bar.pack(side="bottom", fill="x", padx=12, pady=(0, 10))
-        tk.Button(bar, text="刷新战绩", command=refresh_stats, bg=BG2, fg=FG,
-                  relief="flat", font=self.f_s).pack(side="left")
         tk.Button(bar, text="关闭", command=win.destroy, bg=BG2, fg=DIM,
                   relief="flat", bd=0, padx=14, pady=5,
                   font=self.f_s, cursor="hand2").pack(side="right")
 
-    def open_tracker_settings(self):
-        import deck_tracker as tracker
-        cfg = tracker.window_settings()
-        dlg = SettingsDialog(self.root, "记牌器设置", 420, 355)
-        dlg.slider("窗口宽度", "width", 260, 900, 10, cfg["width"], "{:.0f}")
-        dlg.slider("窗口高度", "height", 200, 1080, 10, cfg["height"], "{:.0f}")
-        dlg.check("按内容自动调整高度", "auto", cfg["auto"])
-        dlg.slider("字号", "font", 7, 20, 1, cfg["font"], "{:.0f}")
-        dlg.check("锁定记牌器（鼠标穿透，取消可解锁）", "locked", cfg["locked"])
-        def apply():
-            options = {k: int(dlg.vars[k].get()) for k in ("width", "height", "font")}
-            options["auto"] = bool(dlg.vars["auto"].get())
-            options["locked"] = bool(dlg.vars["locked"].get())
-            save_json(tracker.WINDOW_SETTINGS, options)
-            if tracker._OPEN[0] is not None:
-                tracker._OPEN[0].apply_window_settings(options)
-            dlg.w.destroy()
-        dlg.buttons(apply, label="应用")
-
     def open_deck_tracker(self):
         try:
             import deck_tracker
+        except Exception as e:
+            print("记牌器模块加载失败：%s" % e)
+            return
+        self._ensure_frida()
+        w = deck_tracker.open(self.root)
+        if w is None:
+            # 以前这里静默失败：点了「打开」没反应，用户只能去按重启。
+            # 现在至少留一句，状态栏也会闪一下。
+            print("记牌器没能打开（另一个实例还占着锁，或窗口初始化失败）")
             try:
-                self._ensure_frida()
-            except Exception as exc:
-                print("记牌器：实时读取启动异常：%s" % exc)
-            deck_tracker.open(self.root)
-        except Exception as exc:
-            import traceback
-            detail = traceback.format_exc()
-            print("记牌器窗口打开失败：%s" % exc)
-            print(detail)
-            with open(os.path.join(LOGS, "console-app.log"), "a", encoding="utf8") as output:
-                output.write("记牌器窗口打开失败：%s\n%s\n" % (exc, detail))
-            from tkinter import messagebox
-            messagebox.showerror("记牌器打不开", "记牌器窗口创建失败：%s\n\n完整信息已写入 logs/console-app.log" % exc, parent=self.root)
+                self.sv_status.config(text="记牌器没能打开，请稍后再试一次")
+            except Exception:
+                pass
+        return w
 
+    def open_win_history(self):
+        """历史胜率面板：卡组 × 日期。打开前先补一次归档，
+        免得「刚切完卡组」那一笔还挂在记牌器里没落账。"""
+        try:
+            import win_history
+            win_history.sync()
+        except Exception as e:
+            print("历史胜率归档失败：%s" % e)
+        try:
+            import win_history_ui
+            win_history_ui.open_panel(self.root)
+        except Exception as e:
+            print("历史胜率面板打开失败：%s" % e)
 
     def open_ai_settings(self):
         try:
@@ -1760,13 +1853,135 @@ class App:
         except Exception as e:
             print("AI 陪玩启动失败：%s" % e)
 
-    def _ensure_frida(self):
-        """Check and recover readers off the Tk event loop."""
-        from reader_supervisor import ReaderSupervisor
-        if not hasattr(self, "_reader_supervisor"):
-            self._reader_supervisor = ReaderSupervisor(HERE, self.procs)
-        self._reader_supervisor.ensure()
+    def _deck_window_open(self):
+        """记牌器窗口还开着吗？开着就该保证实时读取在跑。"""
+        try:
+            import deck_tracker
+            return bool(deck_tracker._OPEN[0])
+        except Exception:
+            return False
 
+    def _restart_stale(self, proc):
+        """读取器活着但不出数：请它自己收工，然后重新拉起。
+
+        ⚠️ 绝不 terminate / kill。它身上挂着注入到游戏里的 agent，硬杀会留下
+        「半卸不卸」的 Frida 线程，游戏之后连关都关不掉 —— 2026-11-07 用户
+        实测的「先关游戏 → 未响应」就是这个链条的终点。
+        """
+        stop = os.path.join(LOGS, "_frida.stop")
+        try:
+            with open(stop, "w", encoding="ascii"):
+                pass
+            stopped = True
+            try:
+                proc.wait(timeout=10.0)
+            except Exception:
+                stopped = False
+                print("记牌器：实时读取没响应停止请求，先放着不动它"
+                      "（不强杀，避免把游戏拖死）")
+            if stopped:
+                self.procs.pop("frida", None)
+            try:
+                os.remove(stop)
+            except Exception:
+                pass
+            if stopped:
+                self._frida_try_at = 0
+                self._ensure_frida()
+        except Exception as e:
+            print("记牌器：重启实时读取失败：%s" % e)
+        finally:
+            self._frida_restarting = False
+
+    def _ensure_frida(self):
+        """游戏在、但实时读取没跑时，拉起 frida_live（否则记牌器没有数据）。"""
+        import subprocess
+        try:
+            cur = self.procs.get("frida")
+            p = os.path.join(HERE, "logs", "deck_live.json")
+            try:
+                mtime = os.path.getmtime(p) if os.path.exists(p) else 0.0
+            except Exception:
+                mtime = 0.0
+            started = getattr(self, "_frida_started_at", 0.0)
+            if cur is not None and cur.poll() is None:
+                if not frida_stale(started, mtime):
+                    return
+                if getattr(self, "_frida_restarting", False):
+                    return
+                self._frida_restarting = True
+                threading.Thread(target=self._restart_stale, args=(cur,),
+                                 daemon=True).start()
+                return
+            if cur is not None:
+                rc = cur.poll()
+                self.procs.pop("frida", None)
+                if rc == 0:
+                    # 读取器是自己收尾退出的（正常退出码），意味着它认为游戏已经
+                    # 没了。但游戏可能还在退出流程里（模拟器关得慢），这时再挂上去
+                    # 会把它拖死 —— 用户 2026-11-07 反馈的「先关游戏 → 游戏卡死」
+                    # 就有这一条。记下来，同一个 pid 45 秒内不再碰。
+                    self._dead_pid = getattr(self, "_frida_pid", None)
+                    self._dead_at = time.time()
+            if time.time() - getattr(self, "_frida_try_at", 0) < 12:
+                return          # 刚拉过一次（多半是刚挂掉）：歇一会儿，别每 5 秒拉一次
+            import shadow_warchess_reader as RW
+            pid, _ = RW.find_game_pid()
+            if not pid:
+                # 记牌器开着时每 5 秒问一次，刷屏没意义 —— 一分钟提示一次。
+                # 状态文件跟着一起写（否则界面只会显示笼统的「读取未启动」），
+                # 顺手让读取器把本机进程现场落到 logs\进程识别.log。
+                if time.time() - getattr(self, "_nopid_at", 0) >= 60:
+                    self._nopid_at = time.time()
+                    print("记牌器：没找到游戏进程，实时读取未启动"
+                          "（游戏起来后会自动重试）")
+                    write_reader_status("nopid", 0, "没找到游戏进程")
+                    try:
+                        RW.dump_process_diag()
+                    except Exception:
+                        pass
+                return
+            # 同一个进程刚被读取器放弃过：它多半正在退出，别再挂上去。
+            # 换了新 pid（重新开游戏）就立刻放行，不影响正常使用。
+            if pid == getattr(self, "_dead_pid", None):
+                if time.time() - getattr(self, "_dead_at", 0) < 45:
+                    return
+            # 刚出生的进程不挂：关掉游戏后模拟器会立刻用新 pid 重新起来，
+            # 那个进程还在初始化，一注入就卡住不动。见 pid_age() 的注释。
+            try:
+                age = RW.pid_age(pid)
+            except Exception:
+                age = None
+            if age is not None and age < MIN_GAME_AGE:
+                return
+            # 同一个 pid 最多挂两次。每多挂一次，游戏进程里就多留一份 gum 的
+            # inline hook；两份同时存在时，谁先 detach 谁把代码页还原，
+            # 另一份的 trampoline 就成了悬空跳板 —— 游戏主线程跳进去就再也不回。
+            # 读取器正常时不会死，真死了多半也别再试，重开游戏换个 pid 最干净。
+            tries = getattr(self, "_frida_tries", None)
+            if tries is None:
+                tries = self._frida_tries = {}
+            if tries.get(pid, 0) >= 2:
+                if time.time() - getattr(self, "_frida_skip_at", 0) >= 60:
+                    self._frida_skip_at = time.time()
+                    print("记牌器：这个游戏进程已经挂过两次，为安全起见不再重挂"
+                          "（重开游戏即可恢复）")
+                return
+            tries[pid] = tries.get(pid, 0) + 1
+            self._frida_try_at = time.time()
+            self._frida_started_at = time.time()
+            self._frida_pid = pid
+            write_reader_status("starting", pid, "已找到游戏进程，正在连接")
+            log = open(os.path.join(HERE, "logs", "frida_live.log"), "a",
+                       encoding="utf-8")
+            self.procs["frida"] = subprocess.Popen(
+                [sys.executable, "-u",
+                 os.path.join(HERE, "frida_live.py"), str(pid), "7200"],
+                stdout=log, stderr=subprocess.STDOUT, cwd=HERE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            print("记牌器：已启动实时读取（pid %s）" % pid)
+        except Exception as e:
+            print("记牌器：实时读取启动失败：%s" % e)
 
     def _group(self, label, key, settings_cmd):
         box = tk.Frame(self.page_hj, bg=BG2)
@@ -1790,30 +2005,43 @@ class App:
 
     # ---------------- 阵容统计（服务器门控） ----------------
     def _meta_group(self):
+        """
+        阵容统计入口。**只在已连接服务器时创建**（用户 2026-10-19 要求：
+        没连接就不收集数据，也不显示统计页）。
+        """
         st = meta_client.state()
-        box = tk.Frame(self.page_hj, bg=BG2)
+        box = tk.Frame(self.pad, bg=BG2)
         box.pack(fill="x", padx=12, pady=4)
+        self.meta_box = box
         left = tk.Frame(box, bg=BG2)
         left.pack(side="left", fill="x", expand=True, padx=8, pady=6)
         tk.Label(left, text="阵容统计", bg=BG2, fg=FG, font=self.f_s,
                  anchor="w").pack(fill="x")
-        self.meta_status = tk.Label(left, text=st["reason"],
-                 bg=BG2, fg=DIM, font=self.f_s, anchor="w")
-        self.meta_status.pack(fill="x")
+        tk.Label(left, text="已连接 · %s" % (st.get("server") or ""),
+                 bg=BG2, fg=DIM, font=self.f_s, anchor="w").pack(fill="x")
         right = tk.Frame(box, bg=BG2)
         right.pack(side="right", padx=8, pady=6)
-        self.meta_open = tk.Button(right, text="打开", command=self.open_meta_page, bg=BG, fg=GOLD,
+        tk.Button(right, text="打开", command=self.open_meta_page, bg=BG, fg=GOLD,
                   relief="flat", bd=0, padx=10, pady=4, font=self.f_s,
-                  cursor="hand2", state="normal" if st["available"] else "disabled")
-        self.meta_open.pack(side="right")
-        tk.Button(right, text="设置", command=self.open_meta_settings, bg=BG,
+                  cursor="hand2").pack(side="right")
+        tk.Button(right, text="服务器", command=self.open_meta_settings, bg=BG,
                   fg=DIM, relief="flat", bd=0, padx=8, pady=4, font=self.f_s,
                   cursor="hand2").pack(side="right", padx=4)
 
     def _rebuild_meta_entry(self):
-        st = meta_client.state()
-        self.meta_status.configure(text=st["reason"])
-        self.meta_open.configure(state="normal" if st["available"] else "disabled")
+        """服务器设置改完后重建入口（连上才出现，断开就撤掉）。"""
+        try:
+            old = getattr(self, "meta_box", None)
+            if old is not None:
+                old.destroy()
+                self.meta_box = None
+        except Exception:
+            pass
+        try:
+            if meta_client.available():
+                self._meta_group()
+        except Exception:
+            pass
 
     def open_meta_page(self):
         try:
@@ -1844,7 +2072,6 @@ class App:
             cfg["server"] = (dlg.vars["meta_server"].get() or "").strip()
             ok = False
             if cfg["enabled"] and cfg["server"]:
-                meta_client.save_settings(cfg)
                 ok = meta_client.probe(cfg["server"])       # 最多等 ~5 秒
             else:
                 cfg["connected"] = False
@@ -1886,6 +2113,11 @@ class App:
             self.procs[key] = subprocess.Popen(
                 [PY, "-u"] + args, cwd=cwd, stdout=out, stderr=err,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if key == "frida":
+                # 记下启动时刻：`frida_stale` 靠它判断「起来这么久了还一帧没写」。
+                # _ensure_frida 那条路自己会记，这里补上 _spawn 这条路，
+                # 免得两条启动路径记的东西不一样。
+                self._frida_started_at = time.time()
         except Exception as e:
             print(f"启动 {key} 失败: {e}")
 
@@ -1894,7 +2126,7 @@ class App:
         结束本控制台管理的一个子进程（不区分外部/自启，统一结束）。
 
         ⚠️ frida_live 不能 taskkill：agent 挂在游戏进程里，强杀会让游戏崩。
-        先写停止标记让它自己 unload，等不到才强杀兜底。
+        先写停止标记让它自己 detach；等不到也不强杀（见 _stop_frida）。
         """
         p = self.procs.pop(key, None)
         if key == "frida":
@@ -1913,7 +2145,13 @@ class App:
                     pass
 
     def _stop_frida(self, p=None):
-        """请求读取器卸载；等待在后台线程，不阻塞 Tk/UI 或游戏关闭。"""
+        """请求读取器卸载；等待在后台线程，不阻塞 Tk/UI 或游戏关闭。
+
+        ⚠️ 等不到也**不强杀**。读取器进程一死，它注入到游戏里的 agent 就没人
+        收尾了（Frida 的线程、trampoline 全留在游戏里），游戏之后退出时会被
+        拖住 —— 这正是「开着助手先关游戏 → 未响应」的由来。读取器自己有
+        parent_guard：控制台一退出它就跟着退，所以放着不管也不会变孤儿。
+        """
         stop = os.path.join(LOGS, "_frida.stop")
         try:
             os.makedirs(LOGS, exist_ok=True)
@@ -1925,9 +2163,9 @@ class App:
         def _finish():
             if p is not None and p.poll() is None:
                 try:
-                    p.wait(timeout=3)
+                    p.wait(timeout=8)
                 except Exception:
-                    return
+                    print("记牌器：实时读取还没退出，交给它自己收尾（不强制结束）")
             try:
                 os.remove(stop)
             except Exception:
@@ -1982,20 +2220,31 @@ class App:
             if bool(ld.get("locked", False)):
                 args.append("--locked")
             return (args, HERE)
+        if key == "frida":
+            # 实时读取。以前这里**没有这个分支**，于是 start_one("frida") 落到
+            # 下面的兜底，把影之幻境的开战判定器 watch_mem.py 当成探针拉起来了 ——
+            # 它扫的是幻境的内存，影之诗一个字段都读不到，还会一直扫（游戏卡顿）。
+            # 用户 2026-11-11：先开助手再开游戏，等两分钟完全没数据，就是这个。
+            return ([os.path.join(HERE, "frida_live.py")], HERE)
+        if key != "judge":
+            # 兜底原来直接给 watch_mem：任何一个写错的 key 都会悄悄启动它。
+            # 现在只给 judge，其它一律当调用方写错，明确说出来。
+            print("控制台：未知的模块 %r，未启动" % (key,), flush=True)
+            return (None, HERE)
         delay = str(DEFAULT_JUDGE.get("delay", 0.2))
         return ([os.path.join(HERE, "watch_mem.py"),
                  "--timeout", "10800", "--delay", delay], HERE)
 
     def start_one(self, key, pause=0.0):
-        if key == "frida":
-            self._ensure_frida()
-            return
         # 所有子进程都由控制台自己启动（不再接管外部判定器）
         cur = self.procs.get(key)
         if cur is not None and cur.poll() is None:
             self._update_status()
             return
         args, cwd = self._cmd_for(key)
+        if not args:
+            self._update_status()
+            return
         if pause:
             time.sleep(pause)
         self._spawn(key, args, cwd)
@@ -2030,9 +2279,14 @@ class App:
         # AI 陪玩（宠物）：上次开着就一起恢复（属于影之诗模块）
         if st.get("companion") and tab == "sv":
             self.open_companion()
-        # 实时读取（frida_live）：不恢复的话记牌器没有手牌数据
+        # 实时读取（frida_live）：不恢复的话记牌器没有手牌数据。
+        # ⚠️ 必须走 _ensure_frida，不能 start_one("frida")：
+        #    start_one 走 _cmd_for + _spawn，日志进 frida-out.txt；
+        #    _ensure_frida 会先找游戏 pid、查进程年龄、写 frida_live.log。
+        #    而且当时 _cmd_for 没有 frida 分支，兜底把 watch_mem 拉起来了
+        #    （用户 2026-11-11：先开助手后开游戏，一直「读取未启动」）。
         if st.get("frida") and tab == "sv":
-            self.start_one("frida")
+            self._ensure_frida()
         names = [k for k, _p in order if st.get(k)]
         if st.get("deck"):
             names.append("deck（记牌器）")
@@ -2254,11 +2508,8 @@ class App:
             import companion as _comp
             ac = _comp.load_config()
             if ac.get("enabled") and (ac.get("api_key") or "").strip():
-                prov = str(ac.get("provider") or "").strip().split("（")[0].strip()
-                model = str(ac.get("model") or "").strip()
-                label = " / ".join(x for x in (prov, model) if x)
                 self.ai_status.config(
-                    text="已启用 · %s" % (label or "未选择模型"), fg=GREEN)
+                    text="已启用 · %s" % (ac.get("model") or ""), fg=GREEN)
             else:
                 self.ai_status.config(text="未启用", fg=DIM)
         except Exception:
@@ -2278,14 +2529,35 @@ class App:
         except Exception:
             pass
         now = time.time()
+        # 历史胜率跨天归档：北京 00:00 之后的第一拍就把昨天的账落下来并清零。
+        # 15 秒一轮足够（最多晚 15 秒，日期归属仍按对局时间戳算，不会串天）。
+        if now - getattr(self, "_last_win_archive", 0) >= 15:
+            self._last_win_archive = now
+            self._archive_winrate(None, "定时检查")
         if now - getattr(self, "_last_frida_watchdog", 0) >= 5:
             self._last_frida_watchdog = now
             try:
                 cs = load_json(CONSOLE_SET, DEFAULT_CONSOLE)
-                if cs.get("running", {}).get("frida") and str(cs.get("tab") or "hj") == "sv":
+                want = (bool(cs.get("running", {}).get("frida"))
+                        and str(cs.get("tab") or "hj") == "sv")
+                if want:
                     self._ensure_frida()
-            except Exception:
-                pass
+                else:
+                    # 2026-11-06：开关没勾、但记牌器窗口开着时也要补启动。
+                    # 以前只认开关，于是「先开记牌器、后开游戏」这一种顺序
+                    # 永远起不来 —— 启动那一刻游戏还没上，之后再没人重试，
+                    # 界面就一直停在「当前卡组」，胜负也记不到。
+                    cur = self.procs.get("frida")
+                    if (cur is None or cur.poll() is not None) \
+                            and self._deck_window_open():
+                        self._ensure_frida()
+            except Exception as e:
+                # 以前这里是 except: pass —— 这段真出问题时日志里一个字都没有，
+                # 只能看到「读取未启动」干瞪眼。现在打一次（只打一次，别刷屏）。
+                if not getattr(self, "_wd_err", False):
+                    self._wd_err = True
+                    print("记牌器：看护逻辑出错了：%s: %s"
+                          % (type(e).__name__, e), flush=True)
             self._last_sweep = now
         if getattr(self, "_last_snapshot_cleanup", 0) == 0:
             self._last_snapshot_cleanup = now
@@ -2485,45 +2757,19 @@ class App:
         def live_font(v):
             try:
                 fs = max(8, min(14, int(round(float(v)))))
-                self._font_job = getattr(self, "_font_job", None)
-                if self._font_job is not None:
-                    try:
-                        self.root.after_cancel(self._font_job)
-                    except Exception:
-                        pass
-
-                def _apply():
-                    try:
-                        self._apply_console_fonts(fs)
-                        cs["font_size"] = fs
-                        save_json(CONSOLE_SET, cs)
-                    except Exception:
-                        pass
-
-                self._font_job = self.root.after(250, _apply)
+                self._apply_console_fonts(fs)
+                cs["font_size"] = fs
+                save_json(CONSOLE_SET, cs)
             except Exception:
                 pass
 
         def live_scale(v):
-            """面板大小：整体缩放窗口（和字号独立）；拖动时防抖，停下再应用。"""
+            """面板大小：整体缩放窗口（和字号独立）"""
             try:
                 sc = max(0.7, min(2.0, float(v)))
-                self._scale_job = getattr(self, "_scale_job", None)
-                if self._scale_job is not None:
-                    try:
-                        self.root.after_cancel(self._scale_job)
-                    except Exception:
-                        pass
-
-                def _apply():
-                    try:
-                        self._apply_console_fonts(self.console_font_size, sc)
-                        cs["scale"] = round(sc, 2)
-                        save_json(CONSOLE_SET, cs)
-                    except Exception:
-                        pass
-
-                self._scale_job = self.root.after(250, _apply)
+                self._apply_console_fonts(self.console_font_size, sc)
+                cs["scale"] = round(sc, 2)
+                save_json(CONSOLE_SET, cs)
             except Exception:
                 pass
 
@@ -2568,49 +2814,20 @@ class App:
 
         live_var.trace_add("write", live_mode)
         tk.Label(dlg.body,
-                 text="开启后，影之诗和影之幻境共用直播模式。OBS 可分别采集记牌器、宠物和气泡、幻境面板。",
+                 text="直播模式：OBS 用「窗口采集」选本窗口即可（透明模式抓不到）",
                  bg=BG, fg=DIM, font=dlg.f_s, justify="left", anchor="w",
                  wraplength=430).pack(fill="x", pady=(2, 0))
 
-        dlg.section("显卡（Live2D 宠物）")
-        _gpus, _gpu_idx = [], -1
-        try:
-            import gpu_select
-            _gpus = gpu_select.list_gpus()
-            # 当前选择按「显卡序号」记录（-1 = 自动），换机器时序号对不上就回自动
-            try:
-                _gpu_idx = int(cs.get("gpu_index", -1))
-            except (TypeError, ValueError):
-                _gpu_idx = -1
-            if not (-1 <= _gpu_idx < len(_gpus)):
-                _gpu_idx = -1
-            _opts = [("-1", "自动（系统决定）")]
-            for _i, _g in enumerate(_gpus):
-                _kind = ("独显" if _g["kind"] == "discrete" else
-                         "核显" if _g["kind"] == "integrated" else "显卡")
-                _vram = (" · %d GB" % round(_g["vram_mb"] / 1024)) if _g["vram_mb"] else ""
-                _opts.append((str(_i), "%s（%s%s）" % (_g["name"], _kind, _vram)))
-            _row = tk.Frame(dlg.body, bg=BG)
-            _row.pack(fill="x", pady=(2, 0))
-            _gpu_var = tk.StringVar(value=str(_gpu_idx))
-            dlg.vars["gpu_index"] = _gpu_var
-            for _val, _lab in _opts:
-                tk.Radiobutton(_row, text=_lab, variable=_gpu_var, value=_val,
-                               bg=BG, fg=FG, selectcolor=SELECT,
-                               activebackground=BG2, activeforeground="#ffffff",
-                               font=dlg.f_s, anchor="w", justify="left",
-                               highlightthickness=0).pack(anchor="w")
-            tk.Label(dlg.body,
-                     text="选独显 / 核显会写进 Windows「图形设置」，重启助手生效。\n"
-                          "Windows 只区分「高性能 / 省电」两档，所以选哪块卡等价于选那一档。\n"
-                          "Live2D 走 OpenGL；若没效果，可在 NVIDIA 控制面板 → "
-                          "管理 3D 设置 → 程序设置里把 pythonw.exe 单独指定为高性能。",
-                     bg=BG, fg=DIM, font=dlg.f_s, justify="left", anchor="w",
-                     wraplength=430).pack(fill="x", pady=(2, 0))
-        except Exception as _gpu_err:
-            tk.Label(dlg.body, text="显卡设置不可用：%s" % _gpu_err,
-                     bg=BG, fg=DIM, font=dlg.f_s, anchor="w",
-                     wraplength=430).pack(fill="x")
+        dlg.section("阵容统计")
+        meta_cfg = meta_client.load_settings()
+        dlg.check("启用统计（连接后收集数据）", "console_meta_on",
+                  bool(meta_cfg.get("enabled")))
+        dlg.entry("服务器地址", "console_meta_server",
+                  meta_cfg.get("server") or "", width=30)
+        tk.Label(dlg.body,
+                 text="未连接服务器时：不收集数据，也不显示统计页。",
+                 bg=BG, fg=DIM, font=dlg.f_s, justify="left", anchor="w",
+                 wraplength=430).pack(fill="x", pady=(2, 0))
 
         dlg.section("关闭按钮行为")
         mode_var = dlg.radio_row("点 ✕ 时", "closeAction",
@@ -2644,27 +2861,16 @@ class App:
             ov["liveMode"] = bool(dlg.vars["console_live"].get())
             save_json(CONSOLE_SET, cs)
             save_json(OVERLAY_SET, ov)
-            # 显卡偏好（写 HKCU 的 UserGpuPreferences，重启助手生效）
-            try:
-                if "gpu_index" in dlg.vars:
-                    import gpu_select
-                    _idx = int(dlg.vars["gpu_index"].get())
-                    # 选的是一块具体显卡：独显 → 高性能，核显 → 省电
-                    if 0 <= _idx < len(_gpus):
-                        _mode = (gpu_select.HIGH_PERFORMANCE
-                                 if _gpus[_idx]["kind"] == "discrete"
-                                 else gpu_select.POWER_SAVING)
-                    else:
-                        _mode = gpu_select.AUTO
-                    _ok, _msg = gpu_select.set_preference(
-                        gpu_select.current_exe(), _mode)
-                    if _ok:
-                        cs["gpu_index"] = _idx
-                        cs["gpu_mode"] = _mode
-                        save_json(CONSOLE_SET, cs)
-                    print("显卡：" + _msg)
-            except Exception as _e:
-                print("显卡设置失败：%s" % _e)
+            # 统计服务器：启用且填了地址才探测；未连接时入口会被撤掉
+            meta_cfg["enabled"] = bool(dlg.vars["console_meta_on"].get())
+            meta_cfg["server"] = (dlg.vars["console_meta_server"].get() or "").strip()
+            if meta_cfg["enabled"] and meta_cfg["server"]:
+                meta_client.probe(meta_cfg["server"])
+            else:
+                meta_cfg["connected"] = False
+                meta_cfg["connected_at"] = 0.0
+                meta_client.save_settings(meta_cfg)
+            self._rebuild_meta_entry()
             self.close_action = cs["closeAction"]
             self.console_alpha = cs["consoleAlpha"]
             self._apply_console_fonts(cs["font_size"], cs["scale"])

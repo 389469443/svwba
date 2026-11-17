@@ -194,7 +194,7 @@ def open_settings(parent=None):
         _sizes = list(_pv.SIZES)
         _cur_size = int(_pv.load_cfg().get("size") or _pv.DEFAULT_SIZE)
     except Exception:
-        _sizes, _cur_size = list(_pv.SIZES), _pv.DEFAULT_SIZE
+        _sizes, _cur_size = [200, 260, 340], 260
     size_var = tk.StringVar(value=str(_cur_size))
     size_cb = ttk.Combobox(f_size, textvariable=size_var,
                            values=[str(s) for s in _sizes], state="readonly",
@@ -374,11 +374,6 @@ def open_settings(parent=None):
                     new_cfg["personality"] = pid
                     break
             new_size, new_fps = int(size_var.get()), int(fps_var.get())
-            old_pers = cfg.get("personality")
-            for pid, (label, _text) in companion.PERSONALITIES.items():
-                if label == pers_var.get():
-                    new_cfg["personality"] = pid
-                    break
         except Exception as e:
             messagebox.showerror("保存失败", "设置内容无效：%s" % e, parent=win)
             return
@@ -402,26 +397,6 @@ def open_settings(parent=None):
                         messagebox.showerror("保存失败", "写入配置失败：%s" % error,
                                              parent=win)
                     else:
-                        # 性格换成功 → 按新性格说一句提醒
-                        try:
-                            if new_cfg.get("personality") != old_pers:
-                                _LINES = {
-                                    "gentle": "换好啦～主人今天想听鲸鲸说什么呀？",
-                                    "lively": "哇！性格换好啦，元气满满地上吧！",
-                                    "tsundere": "哼，才、才不是为你换的呢……",
-                                    "toxic": "换了？就这？那我可要好好看看你怎么打。",
-                                }
-                                line = _LINES.get(new_cfg.get("personality"),
-                                                  "换好啦～")
-                                import json as _json
-                                pcmd = os.path.join(companion.HERE, "logs", "_pet_cmd.json")
-                                tmp = pcmd + ".tmp"
-                                with open(tmp, "w", encoding="utf-8") as fh:
-                                    _json.dump({"say": line, "at": time.time()}, fh,
-                                               ensure_ascii=False)
-                                os.replace(tmp, pcmd)
-                        except Exception:
-                            pass
                         win.destroy()
                 except Exception:
                     pass
@@ -490,9 +465,12 @@ def open_settings(parent=None):
     save_btn = None
     for txt, cmd in (("保存", do_save), ("测试 AI", do_test_ai),
                      ("测试语音", do_test), ("关闭", win.destroy)):
+        # 不能写 `_button = tk.Button(...).pack(...)`：pack() 返回 None，
+        # save_btn 就永远是 None，do_save 里一 config 就抛异常，
+        # 保存直接失败（控制台日志里那串 AttributeError 就是这个）。
         _button = tk.Button(bf, text=txt, command=cmd, bg=BG2, fg=GOLD,
-                  relief="flat", bd=0, padx=10, pady=3, font=FONT,
-                  activebackground=BG, cursor="hand2")
+                            relief="flat", bd=0, padx=10, pady=3, font=FONT,
+                            activebackground=BG, cursor="hand2")
         _button.pack(side="left", padx=(0, 6))
         if txt == "保存":
             save_btn = _button

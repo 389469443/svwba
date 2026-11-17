@@ -2,13 +2,13 @@
 rem 强制中文代码页，避免乱码（见使用说明 Q1）
 chcp 936 >nul 2>nul
 rem ============================================================
-rem  影之诗助手 · 修复运行环境
+rem  影之幻境助手 · 修复运行环境
 rem  重新检查 Python / Node.js / 依赖库，缺什么装什么。
 rem  已经装好的会跳过，不会重复下载。
 rem ============================================================
 setlocal
 cd /d "%~dp0"
-title 影之诗助手 · 修复运行环境
+title 影之幻境助手 · 修复运行环境
 
 echo ============================================================
 echo    修复运行环境
@@ -20,7 +20,6 @@ echo.
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0svwb-probe\setup_env.ps1" -Force
 set "RC=%errorlevel%"
-echo 配对结果和下载方法请看同目录的「Frida配对说明.txt」。
 
 echo.
 if "%RC%"=="0" (

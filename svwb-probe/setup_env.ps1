@@ -4,10 +4,9 @@
 
   做什么
   ------
-  1. 找 Python（3.11+）：python-path.txt 指定的 → py 启动器 → PATH → 常见安装目录 → 随包 python\
+  1. 找 Python（3.10+）：python-path.txt 指定的 → py 启动器 → PATH → 常见安装目录 → 随包 python\
   2. 找 Node.js（18+）：随包 node\ → node-path.txt → PATH → 常见安装目录
-  3. 找依赖库：Pillow / NumPy / Frida / pygame / PyOpenGL / live2d-py /
-     requests / edge-tts / keyboard（缺了就 pip install，官方源失败自动换清华镜像）
+  3. 找依赖库：Pillow / NumPy（缺了就 pip install，官方源失败自动换清华镜像）
   4. 缺什么装什么：Python 用 winget 或官方安装包；Node 用官方 zip（免管理员）
   5. 全部就绪 → 写 .env-ready.json 记录（只做记录，不靠它跳过检查）
 
@@ -29,8 +28,7 @@ param(
     [switch]$Check,
     [switch]$Force,
     [switch]$Quiet,
-    [switch]$Quick,
-    [switch]$RepairFrida
+    [switch]$Quick
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,23 +49,6 @@ $PyInstallerUrl = 'https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.
 # 顺序：官网 → 镜像；每个都设了超时，卡住不会无限等。
 $PyMirrorUrl = 'https://mirrors.huaweicloud.com/python/3.12.7/python-3.12.7-amd64.exe'
 $NodeZipMirror = 'https://npmmirror.com/mirrors/node'
-$DepsCheck = Join-Path $Probe 'deps_check.py'
-
-# 运行依赖：mod = Python 导入名，pkg = pip 包名，core = 缺了主程序不能跑。
-# 注意：frida 是记牌器实时读取的核心，pygame/OpenGL/live2d 是 AI 陪玩的核心；
-# 但 pip 偶尔会因为网络/杀毒软件失败，所以只有 Pillow/NumPy 硬性阻止启动，
-# 其余缺失会明确告警并写日志，下次启动/「修复环境.bat」会自动重试。
-$Deps = @(
-    @{ mod = 'PIL';      pkg = 'pillow';    name = 'Pillow';    core = $true  },
-    @{ mod = 'numpy';    pkg = 'numpy';     name = 'NumPy';     core = $true  },
-    @{ mod = 'frida';    pkg = 'frida==17.26.2'; name = 'Frida'; core = $true },
-    @{ mod = 'requests'; pkg = 'requests';  name = 'requests';  core = $false },
-    @{ mod = 'pygame';   pkg = 'pygame';    name = 'pygame';    core = $false },
-    @{ mod = 'OpenGL';   pkg = 'PyOpenGL';  name = 'PyOpenGL';  core = $false },
-    @{ mod = 'live2d';   pkg = 'live2d-py>=1.0.0'; name = 'live2d-py'; core = $false },
-    @{ mod = 'edge_tts'; pkg = 'edge-tts';  name = 'edge-tts';  core = $false },
-    @{ mod = 'keyboard'; pkg = 'keyboard';  name = 'keyboard';  core = $false }
-)
 
 function Say($msg, $color) {
     if (-not $Quiet) {
@@ -181,16 +162,11 @@ function Get-PyVersion($exe, $pre) {
     $parts = $ver.Split('.')
     if ($parts.Length -lt 2) { return $null }
     $major = [int]$parts[0]; $minor = [int]$parts[1]
-    if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 11)) { return $null }
+    if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 10)) { return $null }
     return $ver
 }
 
 function Find-Python {
-    $bundled = Join-Path $Probe 'python\python.exe'
-    if (Test-Path -LiteralPath $bundled) {
-        $version = Get-PyVersion $bundled $null
-        if ($version) { return [pscustomobject]@{ exe = $bundled; pre = @(); version = $version; from = '随包 Python' } }
-    }
     # ① python-path.txt（用户手动指定过，或上次自动装好后写进去的）
     if (Test-Path -LiteralPath $PyPath) {
         try {
@@ -226,8 +202,9 @@ function Find-Python {
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python311\python.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python310\python.exe'),
         'C:\Python313\python.exe', 'C:\Python312\python.exe',
-        'C:\Python311\python.exe'
+        'C:\Python311\python.exe', 'C:\Python310\python.exe'
     )
     foreach ($c in $known) {
         $v = Get-PyVersion $c $null
@@ -362,148 +339,33 @@ function Test-PyModule($py, $mod) {
     } catch { return $false }
 }
 
-function Get-MissingDeps($py, [string[]]$extra) {
-    # 用 deps_check.py 一次性检查（避免 PowerShell 5.1 传 -c 时吃掉引号）。
-    # 老版本升级上来可能没有这个文件，直接退回逐模块 import，避免误判为"齐全"。
-    if (-not (Test-Path -LiteralPath $DepsCheck)) {
-        $names = @()
-        foreach ($d in $Deps) {
-            if (-not (Test-PyModule $py $d.mod)) { $names += $d.mod }
-        }
-        return $names
-    }
-    $a = @()
-    if ($py.pre) { $a += $py.pre }
-    $a += @('-X', 'utf8', $DepsCheck)
-    if ($extra) { $a += $extra }
-    foreach ($d in $Deps) { $a += $d.mod }
-    $out = ''
-    try {
-        $out = (& $py.exe @a 2>$null) -join ' '
-    } catch {
-        $out = ''
-    }
-    if ($LASTEXITCODE -eq 0) { return @() }
-    $out = $out -replace '^\s*MISSING:', ''
-    $names = @($out -split '\s+' | Where-Object { $_ })
-    if ($names.Count -eq 0) {
-        if ($extra -contains "--spec") { return @("frida") }
-        # 检查脚本自身失败（被杀毒拦截/编码问题）时，退回逐模块 import。
-        $names = @()
-        foreach ($d in $Deps) {
-            if (-not (Test-PyModule $py $d.mod)) { $names += $d.mod }
-        }
-    }
-    return $names
-}
-
-function Install-Pip($py, [string[]]$pkgs, [switch]$Mirror) {
-    if (-not $pkgs -or $pkgs.Count -eq 0) { return }
-    $a = @()
-    if ($py.pre) { $a += $py.pre }
-    # --no-cache-dir：pip 的 HTTP 缓存偶尔会留下半截包，表现为 install 卡住
-    # 十分钟没有任何输出（实测 live2d-py）；每次重下更稳，也避免缓存目录权限问题。
-    # --timeout/--retries：国内直连 PyPI 卡住时尽快失败，好切清华镜像。
-    $a += @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-input',
-            '--no-cache-dir', '--prefer-binary', '--timeout', '30', '--retries', '1')
-    if ($RepairFrida -and $pkgs -contains 'frida==17.26.2') { $a += '--force-reinstall' }
-    if ($Mirror) {
-        $a += @('--index-url', 'https://pypi.tuna.tsinghua.edu.cn/simple')
-    } else {
-        $a += @('--index-url', 'https://pypi.org/simple')
-    }
-    $a += $pkgs
-    try { & $py.exe @a 2>$null | Out-Null } catch { }
-}
-
-function Test-FridaLocal($py) {
-    $a = @($py.pre | Where-Object { $_ }) + @('-I', $DepsCheck, '--frida-test')
-    & $py.exe @a | Out-Host
-    return ($LASTEXITCODE -eq 0)
-}
-
-function Save-PythonPath($py) {
-    $a = @($py.pre | Where-Object { $_ }) + @('-c', 'import sys;print(sys.executable)')
-    $exePath = (& $py.exe @a | Select-Object -Last 1)
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exePath)) { Fatal 2 '无法确定已检查的 Python 路径。' }
-    Set-Content -LiteralPath $PyPath -Value $exePath -Encoding Default
-}
-
 function Ensure-PyDeps($py) {
-    $missing = @(Get-MissingDeps $py @())
-    if ($missing.Count -eq 0) { return $true }
-
-    $pkgs = @()
-    foreach ($m in $missing) {
-        $d = $Deps | Where-Object { $_.mod -eq $m } | Select-Object -First 1
-        if ($d) { $pkgs += $d.pkg }
+    $need = @()
+    foreach ($m in @(@{ mod = 'PIL'; pkg = 'pillow' }, @{ mod = 'numpy'; pkg = 'numpy' })) {
+        if (-not (Test-PyModule $py $m.mod)) { $need += $m.pkg }
     }
-    Say ("  缺依赖库：{0}，开始安装……" -f ($pkgs -join ' / ')) 'Yellow'
-    Log ("缺依赖：{0}" -f ($missing -join ','))
-
-    # 中文系统优先走清华镜像：frida 的 wheel 约 61MB，直连 PyPI 在国内容易
-    # 只有几百 KB/s，看起来像卡住五六分钟；镜像通常几十秒。
-    $mirrorFirst = $false
-    try { $mirrorFirst = (Get-Culture).Name -like 'zh-*' } catch { }
-
-    # 逐个安装：pip 一次性解析全部包时，在部分网络/缓存环境下会卡住
-    # （实测 live2d-py 与其它包一起装时 10 分钟没有任何输出）。逐个装
-    # 还能让某个包失败不拖累其它包。
-    foreach ($pkg in $pkgs) {
-        Say ("    安装 {0}……" -f $pkg) 'DarkGray'
-        if ($pkg -like 'frida*') {
-            Say '    frida 安装包约 61MB，首次安装通常 1~3 分钟，请不要关闭窗口……' 'Yellow'
-        }
-        if ($mirrorFirst) {
-            Install-Pip $py @($pkg) -Mirror
-        } else {
-            Install-Pip $py @($pkg)
-        }
+    if ($need.Count -eq 0) { return $true }
+    Say ("  缺依赖库：{0}，开始安装……" -f ($need -join ' / ')) 'Yellow'
+    Log ("缺依赖：{0}" -f ($need -join ','))
+    $base = @()
+    if ($py.pre) { $base += $py.pre }
+    # 第一次：官方源
+    $a = $base + @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-input') + $need
+    try { & $py.exe @a 2>$null | Out-Null } catch { }
+    $ok = $true
+    foreach ($m in @(@{ mod = 'PIL'; pkg = 'pillow' }, @{ mod = 'numpy'; pkg = 'numpy' })) {
+        if (-not (Test-PyModule $py $m.mod)) { $ok = $false }
     }
-    $missing = @(Get-MissingDeps $py @())
-
-    # 第二次：换另一个源逐个重试；某个包失败不会拖累其它包。
-    if ($missing.Count -gt 0) {
-        if ($mirrorFirst) {
-            Say '    镜像源没有装全，换官方源逐个重试……' 'Cyan'
-        } else {
-            Say '    官方源没有装全，换清华镜像逐个重试……' 'Cyan'
-        }
-        Log ("第一轮后仍缺：{0}" -f ($missing -join ','))
-        foreach ($m in $missing) {
-            $d = $Deps | Where-Object { $_.mod -eq $m } | Select-Object -First 1
-            if (-not $d) { continue }
-            if ($mirrorFirst) {
-                Install-Pip $py @($d.pkg)
-            } else {
-                Install-Pip $py @($d.pkg) -Mirror
-            }
-        }
-        $missing = @(Get-MissingDeps $py @())
+    if ($ok) { return $true }
+    # 第二次：清华镜像（国内网络常见）
+    Say '    官方源不可用，换清华镜像重试……' 'Cyan'
+    Log 'pip 官方源失败，改用清华镜像'
+    $a = $base + @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-input',
+                   '-i', 'https://pypi.tuna.tsinghua.edu.cn/simple') + $need
+    try { & $py.exe @a 2>$null | Out-Null } catch { }
+    foreach ($m in @(@{ mod = 'PIL'; pkg = 'pillow' }, @{ mod = 'numpy'; pkg = 'numpy' })) {
+        if (-not (Test-PyModule $py $m.mod)) { return $false }
     }
-    if ($missing.Count -eq 0) { return $true }
-
-    $coreMissing = @()
-    foreach ($m in $missing) {
-        $d = $Deps | Where-Object { $_.mod -eq $m } | Select-Object -First 1
-        if ($d -and $d.core) { $coreMissing += $d.pkg }
-    }
-    if ($coreMissing.Count -gt 0) {
-        Log ("核心依赖安装失败：{0}" -f ($coreMissing -join ','))
-        return $false
-    }
-
-    # 非核心依赖（frida/pygame/live2d/语音等）没装好时不阻止主程序；
-    # 但一定要让用户看到，否则表现就是「记牌器不动 / AI 陪玩不显示」。
-    Say ("  以下依赖没装好：{0}" -f ($missing -join ' / ')) 'Yellow'
-    Say '  主程序仍可启动；记牌器的实时读取、AI 陪玩的模型/语音会受影响。' 'Yellow'
-    Say '  请联网后双击「修复环境.bat」再试一次。' 'Yellow'
-    Log ("非核心依赖未装好：{0}" -f ($missing -join ','))
-    try {
-        $missFile = Join-Path $LogDir '依赖缺失.txt'
-        if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
-        Set-Content -LiteralPath $missFile -Value ($missing -join "`r`n") -Encoding UTF8
-    } catch { }
     return $true
 }
 
@@ -530,11 +392,14 @@ if ($Quick) {
     if (-not $qpy) { exit 1 }
     $qnode = Find-Node
     if (-not $qnode) { exit 1 }
-    # 依赖库合并成一次检查（--spec 只查是否安装，不 import，约几十毫秒）。
-    if (-not (Test-Path -LiteralPath $DepsCheck)) { exit 1 }
-    $qmissing = @(Get-MissingDeps $qpy @('--spec'))
-    if ($qmissing.Count -gt 0) { exit 1 }
-    Save-PythonPath $qpy
+    # 依赖库合并成一次 python 启动检查（省 0.2 秒）
+    try {
+        $a = @()
+        if ($qpy.pre) { $a += $qpy.pre }
+        $a += @('-c', 'import PIL, numpy')
+        & $qpy.exe @a 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+    } catch { exit 1 }
     exit 0
 }
 
@@ -543,18 +408,9 @@ Say '  影之幻境助手 · 运行环境检查' 'Cyan'
 Say '============================================================' 'DarkGray'
 Log '==== 环境检查开始 ===='
 
-$pairRequested = $Force -or $RepairFrida
-$pairReport = Join-Path $Root 'Frida配对说明.txt'
-if ($pairRequested) {
-    $osArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
-    @("影之诗助手 v1.1.2 · Frida 配对说明", "Windows：$([Environment]::OSVersion.VersionString)；架构：$osArch",
-      "尚未完成 Python 检查。若自动安装失败，请在支持 x64 的 Windows 上安装 CPython 3.12 (64-bit)。",
-      "下载：https://www.python.org/downloads/windows/", "装好后再次双击「修复环境.bat」。") |
-        Set-Content -LiteralPath $pairReport -Encoding UTF8
-}
 $py = Find-Python
 if (-not $py) {
-    if ($Check) { Fatal 2 '缺少 Python 3.11+（只检查模式，未安装）' }
+    if ($Check) { Fatal 2 '缺少 Python 3.10+（只检查模式，未安装）' }
     $py = Install-Python
     if (-not $py) {
         Fatal 2 ("没能自动安装 Python。请手动安装：{0}`n安装时勾选 Add python.exe to PATH，装好后再双击「修复环境.bat」。" -f 'https://www.python.org/downloads/')
@@ -562,14 +418,6 @@ if (-not $py) {
 }
 Say ("  Python：{0}  {1}  [{2}]" -f $py.exe, $py.version, $py.from) 'Green'
 
-if ($pairRequested) {
-    $a = @($py.pre | Where-Object { $_ }) + @('-X','utf8',(Join-Path $Probe 'frida_pair.py'))
-    & $py.exe @a
-    $rc = $LASTEXITCODE
-    Say ("Frida 检查说明已保存：{0}" -f $pairReport) 'Cyan'
-    if ($rc -ne 0) { exit $rc }
-    Save-PythonPath $py
-}
 $node = Find-Node
 if (-not $node) {
     if ($Check) { Fatal 3 '缺少 Node.js 18+（只检查模式，未安装）' }
@@ -581,31 +429,23 @@ if (-not $node) {
 Say ("  Node.js：{0}  {1}  [{2}]" -f $node.exe, $node.version, $node.from) 'Green'
 
 if ($Check) {
-    $dmiss = @(Get-MissingDeps $py @())
-    $bad = $false
-    foreach ($d in $Deps) {
-        if ($dmiss -contains $d.mod) {
-            Say ("  {0}：缺失" -f $d.name) 'Red'
-            $bad = $true
+    foreach ($m in @(@{ mod = 'PIL'; pkg = 'Pillow' }, @{ mod = 'numpy'; pkg = 'NumPy' })) {
+        if (Test-PyModule $py $m.mod) {
+            Say ("  {0}：已安装" -f $m.pkg) 'Green'
         } else {
-            Say ("  {0}：已安装" -f $d.name) 'Green'
+            Say ("  {0}：缺失" -f $m.pkg) 'Red'
+            exit 4
         }
     }
-    if ($bad) { exit 4 }
-    if (-not (Test-FridaLocal $py)) { Fatal 5 "Frida 本机读取自检失败。" }
     Say '环境就绪（只检查模式，未做任何安装）' 'Cyan'
     Log '只检查模式：环境就绪'
     exit 0
 }
 
 if (-not (Ensure-PyDeps $py)) {
-    if (@(Get-MissingDeps $py @()) -contains "frida") { Fatal 5 "Frida 在线安装失败。请双击同目录的「修复环境.bat」，按生成的 Frida配对说明.txt 操作。" }
-    Fatal 4 ("依赖库没装好。请手动执行：`n  `"{0}`" -m pip install pillow numpy frida pygame PyOpenGL live2d-py requests edge-tts" -f $py.exe)
+    Fatal 4 ("依赖库没装好。请手动执行：`n  `"{0}`" -m pip install pillow numpy" -f $py.exe)
 }
-if (-not (Test-FridaLocal $py)) {
-    Fatal 5 'Frida 未能读取本机测试进程。请检查安全软件的拦截记录，再双击同目录的「修复环境.bat」查看配对说明。'
-}
-Say '  运行依赖：已检查（缺的已尝试自动安装）' 'Green'
+Say '  Pillow / NumPy：已安装' 'Green'
 
 # 写回 python-path.txt / node-path.txt，让 启动.bat 和 Python 侧都能找到
 #
@@ -614,7 +454,7 @@ Say '  运行依赖：已检查（缺的已尝试自动安装）' 'Green'
 #     否则 BOM 会被当成路径的一部分；中文路径在中文系统上也能正常工作。
 #   · node-path.txt 是 **Python** 读的 → UTF-8 无 BOM。
 try {
-    Save-PythonPath $py
+    Set-Content -LiteralPath $PyPath -Value $py.exe -Encoding Default
     [IO.File]::WriteAllText($NodePath, $node.exe, (New-Object Text.UTF8Encoding($false)))
 } catch {
     Log ("写 python-path.txt / node-path.txt 失败：{0}" -f $_.Exception.Message)
@@ -631,13 +471,6 @@ try {
         node_version   = $node.version
         pillow         = (Get-PipVersion $py 'pillow')
         numpy          = (Get-PipVersion $py 'numpy')
-        frida          = (Get-PipVersion $py 'frida')
-        pygame         = (Get-PipVersion $py 'pygame')
-        pyopengl       = (Get-PipVersion $py 'PyOpenGL')
-        live2d         = (Get-PipVersion $py 'live2d-py')
-        requests       = (Get-PipVersion $py 'requests')
-        edge_tts       = (Get-PipVersion $py 'edge-tts')
-        keyboard       = (Get-PipVersion $py 'keyboard')
         script         = $MyInvocation.MyCommand.Path
     }
     ($info | ConvertTo-Json) | Set-Content -LiteralPath $Marker -Encoding UTF8

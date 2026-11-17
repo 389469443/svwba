@@ -39,16 +39,7 @@ GAME = os.path.join(ROOT, "dsh-shadowverse-huanjing")
 LIVE = os.path.join(GAME, "shots", "live")
 LOGS = os.path.join(HERE, "logs")
 LIMIT = 2 * 1024 * 1024                            # 单文件最多 2MB
-def _load_version():
-    try:
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "版本.txt")
-        with open(p, encoding="utf-8") as fh:
-            return "v" + fh.read().strip()
-    except Exception:
-        return "v1.1.3"
-
-
-VERSION = _load_version()
+VERSION = "v0.1.0"
 
 
 def _tail_text(path, max_bytes=LIMIT):
@@ -78,30 +69,20 @@ def _recent(paths, n=30):
     return items[:n]
 
 
-def _game_player_logs():
-    """Unity 的 Player.log，只收影之诗相关（国服 netease/MuMu 或国际服 Cygames）。"""
-    base = os.path.join(os.path.expanduser("~"), "AppData", "LocalLow")
+def _game_player_log():
+    """Unity 的 Player.log：%LOCALAPPDATA%Low\\netease\\<游戏目录>\\Player.log"""
+    base = os.path.join(os.path.expanduser("~"), "AppData", "LocalLow", "netease")
     if not os.path.isdir(base):
-        return []
+        return None
     cands = []
-    for company in os.listdir(base):
-        cpath = os.path.join(base, company)
-        if not os.path.isdir(cpath):
-            continue
-        try:
-            products = os.listdir(cpath)
-        except OSError:
-            continue
-        for product in products:
-            p = os.path.join(cpath, product, "Player.log")
-            if not os.path.isfile(p):
-                continue
-            tag = (company + "/" + product).lower()
-            if not any(k in tag for k in ("shadowverse", "影之诗", "mumu", "cygames")):
-                continue
+    for d in os.listdir(base):
+        p = os.path.join(base, d, "Player.log")
+        if os.path.isfile(p):
             cands.append(p)
+    if not cands:
+        return None
     cands.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return cands[:4]
+    return cands[0]
 
 
 def _screen_size():
@@ -159,8 +140,8 @@ def _env_summary():
     return "\r\n".join(lines)
 
 
-def _readme(ts, entries=None):
-    lines = [
+def _readme(ts):
+    return "\r\n".join([
         "影之幻境助手 · 诊断包",
         "====================",
         "",
@@ -173,29 +154,20 @@ def _readme(ts, entries=None):
         "  3. 你期望它是什么样",
         "  4. 能不能稳定复现（每次都这样 / 偶尔一次）",
         "  5. 当时游戏在干什么（开战瞬间 / 运营阶段 / 刚开一局 / 结算画面）",
-        "  6. 用的是哪个客户端（国服 PC 客户端 / MuMu 模拟器 / Steam 国际服 ShadowverseWB）",
         "",
         "【包里都有什么】",
         "  说明.txt        本文件",
-        "  日志/           判定器、面板、控制台、读取器的日志（*.log/*.txt/*.json，"
-        "含国际服 international_session / international_candidates / deck_live）",
+        "  日志/           判定器、面板、控制台自己的日志（含 光环解析失败.log、环境检查.log）",
         "  数据/           overlay.json、战绩、各种设置、窗口位置",
-        "  对照证据/       每场战斗自动存的「画面截图 + 当时的内存读数」",
-        "  游戏日志/       游戏自己的 Unity 日志尾部（国服 netease / 国际服 WB 都收）",
+        "  对照证据/       每场战斗自动存的「画面截图 + 当时的内存读数」（找读数/规则错误最有用的）",
+        "  游戏日志/       游戏自己的 Unity 日志尾部（Player.log），有才带",
         "  环境/           Python/Node 版本、屏幕与缩放、相关进程",
         "",
-    ]
-    if entries:
-        lines.append("【本次实际收集到 %d 个条目】" % len(entries))
-        lines.extend("  " + e for e in sorted(entries))
-        lines.append("")
-    lines.extend([
         "【怎么发】",
         "  把这个 zip 直接发给作者即可，不需要其它东西。",
         "  注意：zip 里可能包含游戏画面截图，转发前自己看一眼。",
         "",
     ])
-    return "\r\n".join(lines)
 
 
 def collect(open_folder=True):
@@ -205,14 +177,12 @@ def collect(open_folder=True):
     os.makedirs(outdir, exist_ok=True)
     zpath = os.path.join(outdir, "HJ诊断-%s.zip" % ts)
     added = 0
-    entries = []
 
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         def put(arc, text):
             nonlocal added
             z.writestr(arc, text)
             added += 1
-            entries.append(arc)
 
         def put_file(arc, path):
             nonlocal added
@@ -220,14 +190,15 @@ def collect(open_folder=True):
                 return False
             z.writestr(arc, _tail_text(path))
             added += 1
-            entries.append(arc)
             return True
 
-        # ① 本工具日志（含国际服读取器的 session / 候选 / 实时快照）
+        put("说明.txt", _readme(stamp))
+
+        # ① 本工具日志
         log_files = []
-        for pat in ("*.txt", "*.log", "*.json"):
+        for pat in ("*.txt", "*.log"):
             log_files.extend(glob.glob(os.path.join(LOGS, pat)))
-        for p in _recent(log_files, 40):
+        for p in _recent(log_files, 30):
             put_file("日志/" + os.path.basename(p), p)
 
         # ② 数据（覆盖判定器输出 + 战绩 + 设置 + 位置）
@@ -243,6 +214,9 @@ def collect(open_folder=True):
             (os.path.join(LOGS, "judge-settings.json"), "数据/judge-settings.json"),
             (os.path.join(LOGS, "panel-pos.json"), "数据/panel-pos.json"),
             (os.path.join(LOGS, "_last_game_record.json"), "数据/_last_game_record.json"),
+            # 2026-11-13：找不到游戏进程时探针自己留的两个现场（谁的问题一眼看出来）
+            (os.path.join(LOGS, "reader_status.json"), "数据/reader_status.json"),
+            (os.path.join(LOGS, "进程识别.log"), "数据/进程识别.log"),
         ]
         for path, arc in data_cands:
             put_file(arc, path)
@@ -253,22 +227,17 @@ def collect(open_folder=True):
                 if os.path.isfile(p):
                     z.write(p, "对照证据/" + os.path.basename(p))
                     added += 1
-                    entries.append("对照证据/" + os.path.basename(p))
 
-        # ④ 游戏自己的 Unity 日志（国服 netease / 国际服 WB 都收，只留尾部）
-        for glog in _game_player_logs():
-            company = os.path.basename(os.path.dirname(os.path.dirname(glog)))
-            product = os.path.basename(os.path.dirname(glog))
-            put_file("游戏日志/%s_%s_Player.log" % (company, product), glog)
+        # ④ 游戏自己的 Unity 日志（有就带，只留尾部）
+        glog = _game_player_log()
+        if glog:
+            put_file("游戏日志/" + os.path.basename(glog), glog)
 
         # ⑤ 环境
         put("环境/系统信息.txt", _env_summary())
         put_file("环境/python-path.txt", os.path.join(HERE, "python-path.txt"))
         put_file("环境/node-path.txt", os.path.join(HERE, "node-path.txt"))
         put_file("环境/.env-ready.json", os.path.join(HERE, ".env-ready.json"))
-
-        # ⑥ 说明放在最后写：列实际收集到的条目，不再写死清单
-        put("说明.txt", _readme(stamp, entries))
 
     size = os.path.getsize(zpath)
     print("诊断包已生成：")

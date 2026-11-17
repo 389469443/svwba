@@ -117,17 +117,11 @@ def decode(text):
 
 
 def encode_seg(card_id):
-    """CardId → 卡组码段（反向）。
-
-    4 字符 = 24 bit（旧码，常见卡 id），5 字符 = 30 bit（国服新码）。
-    之前只支持 24 bit，卡 id >= 16,777,216 就直接报错
-    （90021320 这类特殊卡会炸），和 decode_seg 支持的 5 字符对不上。
-    """
-    if not (0 <= card_id < (1 << 30)):
-        raise ValueError("card id 超出 30bit: %r" % card_id)
-    width = 4 if card_id < (1 << 24) else 5
+    """CardId → 4 字符（反向）。"""
+    if not (0 <= card_id < (1 << 24)):
+        raise ValueError("card id 超出 24bit: %r" % card_id)
     out = []
-    for shift in range((width - 1) * 6, -1, -6):
+    for shift in (18, 12, 6, 0):
         out.append(FULL[(card_id >> shift) & 63])
     return "".join(out)
 

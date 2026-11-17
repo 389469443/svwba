@@ -55,7 +55,10 @@ FONT_FAMILY = "Microsoft YaHei UI"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_STATE_FALLBACK = os.path.join(
-    r"C:\Users\33949\Documents\deepseek-harness\default-workspace",
+    # 兜底路径改成包内相对位置：
+    # 原来写死的是开发机绝对路径（换台机器一定不存在，
+    # 发包也不该带别人的用户名）。
+    os.path.dirname(HERE),
     "dsh-shadowverse-huanjing", "shots", "live", "overlay.json")
 
 
